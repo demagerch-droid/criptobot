@@ -1445,8 +1445,9 @@ async def on_startup(dp: Dispatcher):
 
 
 if __name__ == "__main__":
-    import asyncio
-from aiogram import Bot, Dispatcher
+    from aiogram import executor
+    executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
+
 
 async def main():
     bot = Bot(token=BOT_TOKEN)
