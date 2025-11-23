@@ -24,14 +24,14 @@ from aiogram.dispatcher.filters import Text
 # Но я оставил твои реальные данные как значения по умолчанию, чтобы всё сразу работало.
 # Если хочешь усилить безопасность — просто удали значения по умолчанию и используй только os.getenv(...).
 
-BOT_TOKEN = os.getenv("8330326273:AAEuWSwkqi7ypz1LZL4LXRr2jSMpKjGc36k")
-ADMIN_ID = int(os.getenv("682938643"))
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8330326273:AAEuWSwkqi7ypz1LZL4LXRr2jSMpKjGc36k")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "682938643"))
 
-TRONGRID_API_KEY = os.getenv("b33b8d65-10c9-4f7b-99e0-ab47f3bbb60f")
-WALLET_ADDRESS = os.getenv("TSY9xf24bQ3Kbd1Njp2w4pEEoqJow1nfpr")
+TRONGRID_API_KEY = os.getenv("TRONGRID_API_KEY", "b33b8d65-10c9-4f7b-99e0-ab47f3bbb60f")
+WALLET_ADDRESS = os.getenv("WALLET_ADDRESS", "TSY9xf24bQ3Kbd1Njp2w4pEEoqJow1nfpr")
 
 # Закрытый канал с сигналами
-CHANNEL_ID = int(os.getenv("-1003464806734"))
+CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1003464806734"))
 
 # Новостной канал — ПОТОМ:
 # когда создашь канал, вставь сюда его ID ИЛИ задай NEWS_CHANNEL_ID в env.
