@@ -14,7 +14,6 @@ from aiogram.types import (
     KeyboardButton,
     InputFile,
 )
-from aiogram.utils import executor
 from aiogram.dispatcher.filters import Text
 
 # ==========================
