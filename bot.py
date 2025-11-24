@@ -992,7 +992,7 @@ async def admin_all_subs(message: types.Message):
         return
 
     cursor.execute("SELECT * FROM subscriptions")
-    rows = cursor.fetchall()cursor.execute("""
+    cursor.execute("""
     SELECT
         user_id,
         paid,
@@ -1003,6 +1003,7 @@ async def admin_all_subs(message: types.Message):
     FROM subscriptions
 """)
 rows = cursor.fetchall()
+
 
     if not rows:
         return await message.answer("Пока нет подписчиков.")
@@ -1460,15 +1461,5 @@ if __name__ == "__main__":
     executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
 
 
-async def main():
-    bot = Bot(token=BOT_TOKEN)
-    dp = Dispatcher()
 
-    # подключи свои роутеры
-    dp.include_router(router)
-
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    asyncio.run(main())
 
