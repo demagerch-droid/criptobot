@@ -6,7 +6,8 @@ import sqlite3
 from datetime import datetime, timedelta
 
 import aiohttp
-from aiogram import Bot, Dispatcher, executor, types
+from aiogram import Bot, Dispatcher, types
+from aiogram.utils import executor
 from aiogram.dispatcher.filters import Text, Command
 from aiogram.types import (
     ReplyKeyboardMarkup,
