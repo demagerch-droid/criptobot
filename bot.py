@@ -991,25 +991,24 @@ async def admin_all_subs(message: types.Message):
     if not is_admin(message.from_user.id):
         return
 
-    cursor.execute("SELECT * FROM subscriptions")
     cursor.execute("""
-    SELECT
-        user_id,
-        paid,
-        start_date,
-        end_date,
-        last_tx_amount,
-        last_tx_time
-    FROM subscriptions
-""")
-rows = cursor.fetchall()
-
+        SELECT
+            user_id,
+            paid,
+            start_date,
+            end_date,
+            last_tx_amount,
+            last_tx_time
+        FROM subscriptions
+    """)
+    rows = cursor.fetchall()
 
     if not rows:
         return await message.answer("Пока нет подписчиков.")
 
     text = "📊 <b>Все подписчики:</b>\n\n"
     chunks = []
+
     for user_id, paid, start_date, end_date, last_tx_amount, last_tx_time in rows:
         status = "🟢 Активна" if paid == 1 else "🔴 Не активна"
         text += (
@@ -1020,14 +1019,17 @@ rows = cursor.fetchall()
             f"Последний платёж: {last_tx_amount} USDT ({last_tx_time})\n"
             "───────────────\n"
         )
+
         if len(text) > 3500:
             chunks.append(text)
             text = ""
+
     if text:
         chunks.append(text)
 
     for chunk in chunks:
         await message.answer(chunk)
+
 
 
 @dp.message_handler(Text(equals="🔥 Активные подписчики"))
