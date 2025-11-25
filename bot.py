@@ -734,23 +734,24 @@ async def i_paid(message: types.Message):
 
     pid, uid, base_amount, unique_amount, status, created_at, confirmed_at, tx_amount, tx_time, tx_id = purchase
 
-    found = await check_payment_for_purchase(purchase)
-        if found:
-        await after_success_payment(purchase, manual_check=True)
-    else:
-        # оставляем ту же клавиатуру, чтобы можно было нажимать "Я оплатил" сколько угодно
-        kb = ReplyKeyboardMarkup(resize_keyboard=True)
-        kb.row(KeyboardButton("✅ Я оплатил"), KeyboardButton("⬅️ В меню"))
+found = await check_payment_for_purchase(purchase)
+if found:
+    await after_success_payment(purchase, manual_check=True)
+else:
+    # оставляем ту же клавиатуру, чтобы можно было нажимать "Я оплатил" сколько угодно
+    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row(KeyboardButton("✅ Я оплатил"), KeyboardButton("⬅️ В меню"))
 
-        await message.answer(
-            "❌ Пока не вижу платёж с твоей уникальной суммой.\n"
-            "Если ты только что отправил — подожди 1–2 минуты и нажми ещё раз.\n"
-            f"Если есть сомнения — напиши в поддержку: {SUPPORT_CONTACT}",
-            reply_markup=kb,
-        )
-        await log_to_admin(
-            f"Пользователь {message.from_user.id} нажал 'Я оплатил', но платёж не найден автоматически."
-        )
+    await message.answer(
+        "❌ Пока не вижу платёж с твоей уникальной суммой.\n"
+        "Если ты только что отправил — подожди 1–2 минуты и нажми ещё раз.\n"
+        f"Если есть сомнения — напиши в поддержку: {SUPPORT_CONTACT}",
+        reply_markup=kb,
+    )
+    await log_to_admin(
+        f"Пользователь {message.from_user.id} нажал 'Я оплатил', но платёж не найден автоматически."
+    )
+
 
 
 
