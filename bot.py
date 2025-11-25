@@ -2,8 +2,11 @@ import logging
 import sqlite3
 from datetime import datetime
 import os
+import random
+import time
 from typing import List, Tuple
 
+import aiohttp
 from aiogram import Bot, Dispatcher, types
 from aiogram.utils import executor
 from aiogram.dispatcher.filters import Text
@@ -18,29 +21,24 @@ from aiogram.types import (
 # НАСТРОЙКИ
 # ==========================
 
-# Либо берём из переменных окружения (на хостинге),
-# либо можно временно прописать прямо тут.
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8330326273:AAEuWSwkqi7ypz1LZL4LXRr2jSMpKjGc36k")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "682938643"))
 
-# Цена и реферальная система
-PRODUCT_PRICE_USD = 100           # цена доступа
-REF_L1_PERCENT = 50               # первый уровень (50% = 50$)
-REF_L2_PERCENT = 10               # второй уровень (10% = 10$)
+TRONGRID_API_KEY = os.getenv("TRONGRID_API_KEY", "b33b8d65-10c9-4f7b-99e0-ab47f3bbb60f")
+WALLET_ADDRESS = os.getenv("WALLET_ADDRESS", "TSY9xf24bQ3Kbd1Njp2w4pEEoqJow1nfpr")
+CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1003464806734"))
 
-# Реквизиты для оплаты (замени на свои)
-PAYMENT_DETAILS = (
-    "💸 *Реквизиты для оплаты доступа:*\n\n"
-    f"Сумма: *{PRODUCT_PRICE_USD} USDT* (или эквивалент в $)\n"
-    "Сеть: *TRC-20*\n"
-    "Кошелёк: `TSY9xf24bQ3Kbd1Njp2w4pEEoqJow1nfpr`\n\n"
-    "После оплаты нажми кнопку *«✅ Я оплатил»* и дождись подтверждения от админа.\n"
-    "Если что-то пошло не так — сразу пиши в поддержку."
-)
+PRODUCT_PRICE_USD = 100
+REF_L1_PERCENT = 50
+REF_L2_PERCENT = 10
 
-SUPPORT_CONTACT = "@your_support_username"  # замени на свой @
+SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT", "@your_support_username")
 
 DB_PATH = "database.db"
+
+# интервалы фоновой проверки
+PAYMENT_SCAN_INTERVAL = 60  # 60 секунд
+TRON_TRANSACTIONS_LIMIT = 50  # сколько последних транзакций смотреть
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN, parse_mode="Markdown")
@@ -53,7 +51,6 @@ dp = Dispatcher(bot)
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 cursor = conn.cursor()
 
-# Пользователи
 cursor.execute(
     """
     CREATE TABLE IF NOT EXISTS users (
@@ -66,26 +63,29 @@ cursor.execute(
         balance REAL DEFAULT 0,
         level1_earned REAL DEFAULT 0,
         level2_earned REAL DEFAULT 0,
-        total_withdrawn REAL DEFAULT 0
+        total_withdrawn REAL DEFAULT 0,
+        has_access INTEGER DEFAULT 0
     );
     """
 )
 
-# Покупки (заявки на оплату доступа)
 cursor.execute(
     """
     CREATE TABLE IF NOT EXISTS purchases (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
-        amount REAL,
+        base_amount REAL,
+        unique_amount REAL,
         status TEXT,
         created_at TEXT,
-        confirmed_at TEXT
+        confirmed_at TEXT,
+        tx_amount REAL,
+        tx_time TEXT,
+        tx_id TEXT
     );
     """
 )
 
-# Реферальные начисления
 cursor.execute(
     """
     CREATE TABLE IF NOT EXISTS referral_earnings (
@@ -101,9 +101,51 @@ cursor.execute(
 
 conn.commit()
 
+# ==========================
+# АНТИ-СПАМ (простая защита)
+# ==========================
+
+user_messages = {}  # user_id -> [timestamps]
+SPAM_WINDOW = 10     # секунд
+SPAM_LIMIT = 8       # сообщений за окно
+SPAM_COOLDOWN = 5    # секунд блокировки
+
+user_spam_block = {}  # user_id -> until_timestamp
+
+
+async def anti_spam(message: types.Message) -> bool:
+    """Простая защита от спама, чтобы не забивали бота."""
+    uid = message.from_user.id
+    now = time.time()
+
+    # если пользователь заблокирован на время
+    until = user_spam_block.get(uid)
+    if until and now < until:
+        # молча игнорируем
+        return False
+
+    times = user_messages.get(uid, [])
+    # очищаем старые
+    times = [t for t in times if now - t <= SPAM_WINDOW]
+    times.append(now)
+    user_messages[uid] = times
+
+    if len(times) > SPAM_LIMIT:
+        user_spam_block[uid] = now + SPAM_COOLDOWN
+        try:
+            await message.answer("⏳ Слишком много сообщений подряд. Подожди пару секунд.")
+        except Exception:
+            pass
+        return False
+
+    return True
+
+# ==========================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ БД
+# ==========================
+
 
 def save_user(user: types.User, referrer_id: int = None):
-    """Создаём/обновляем пользователя в базе."""
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     cursor.execute(
         """
@@ -131,29 +173,68 @@ def get_user(user_id: int):
     return cursor.fetchone()
 
 
-def create_purchase(user_id: int, amount: float):
+def create_purchase(user_id: int, base_amount: float, unique_amount: float):
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     cursor.execute(
         """
-        INSERT INTO purchases (user_id, amount, status, created_at, confirmed_at)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO purchases (user_id, base_amount, unique_amount, status, created_at, confirmed_at, tx_amount, tx_time, tx_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (user_id, amount, "pending", now, "")
+        (user_id, base_amount, unique_amount, "pending", now, "", 0.0, "", ""),
     )
     conn.commit()
 
 
-def confirm_purchase(purchase_id: int):
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+def get_last_pending_purchase(user_id: int):
     cursor.execute(
-        "UPDATE purchases SET status = 'confirmed', confirmed_at = ? WHERE id = ?",
-        (now, purchase_id),
+        """
+        SELECT id, user_id, base_amount, unique_amount, status, created_at, confirmed_at, tx_amount, tx_time, tx_id
+        FROM purchases
+        WHERE user_id = ? AND status = 'pending'
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        (user_id,),
+    )
+    return cursor.fetchone()
+
+
+def get_all_pending_purchases():
+    cursor.execute(
+        """
+        SELECT id, user_id, base_amount, unique_amount, status, created_at, confirmed_at, tx_amount, tx_time, tx_id
+        FROM purchases
+        WHERE status = 'pending'
+        """
+    )
+    return cursor.fetchall()
+
+
+def confirm_purchase_record(purchase_id: int, tx_amount: float, tx_time: str, tx_id: str):
+    cursor.execute(
+        """
+        UPDATE purchases
+        SET status = 'confirmed',
+            confirmed_at = ?,
+            tx_amount = ?,
+            tx_time = ?,
+            tx_id = ?
+        WHERE id = ?
+        """,
+        (datetime.now().strftime("%Y-%m-%d %H:%M"), tx_amount, tx_time, tx_id, purchase_id),
+    )
+    conn.commit()
+
+
+def set_access(user_id: int, has_access: bool = True):
+    cursor.execute(
+        "UPDATE users SET has_access = ? WHERE user_id = ?",
+        (1 if has_access else 0, user_id),
     )
     conn.commit()
 
 
 def add_referral_bonus(referrer_id: int, referred_id: int, level: int, bonus: float):
-    """Добавляем реферальный бонус и обновляем баланс пользователя."""
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     cursor.execute(
         """
@@ -175,7 +256,6 @@ def add_referral_bonus(referrer_id: int, referred_id: int, level: int, bonus: fl
         )
 
     conn.commit()
-
 
 # ==========================
 # ОБУЧЕНИЕ: ТРЕЙДИНГ
@@ -233,7 +313,7 @@ TRADING_LESSONS: List[Tuple[str, str]] = [
 ]
 
 # ==========================
-# ОБУЧЕНИЕ: ТРАФИК ИЗ TIKTOK
+# ОБУЧЕНИЕ ТРАФИКУ
 # ==========================
 
 TRAFFIC_LESSONS: List[Tuple[str, str]] = [
@@ -304,7 +384,7 @@ TRAFFIC_LESSONS: List[Tuple[str, str]] = [
         "Отвечай так:\n"
         "• 'Реально ли это работает?' — 'Да. У нас 2 источника дохода: трейдинг + реферальная система 50%/10%.'\n"
         "• 'Сколько можно заработать?' — 'Кто-то отбивает 100$ за 2 человек, дальше идёт в плюс.'\n"
-        "• 'Это пирамида?' — 'Нет. Ты покупаешь доступ к системе обучения и сигналам. Партнёрка — это бонус за то, что делишься.'\n\n"
+        "• 'Это пирамида?' — 'Нет. Ты покупаешь доступ к системе обучения и сигналам. Партнёрка — бонус за то, что делишься.'\n\n"
         "Не спорь и не оправдывайся. Коротко, уверенно, по делу."
     ),
     (
@@ -353,9 +433,8 @@ def lessons_keyboard(lessons: List[Tuple[str, str]], prefix: str) -> InlineKeybo
         kb.insert(InlineKeyboardButton(text=title, callback_data=f"{prefix}:{idx}"))
     return kb
 
-
 # ==========================
-# ХЕЛПЕРЫ
+# УТИЛИТЫ
 # ==========================
 
 def is_admin(user_id: int) -> bool:
@@ -370,18 +449,70 @@ async def log_to_admin(text: str):
 
 
 # ==========================
-# ОБРАБОТЧИКИ
+# TRONGRID: ПРОВЕРКА ОПЛАТЫ
+# ==========================
+
+async def fetch_trc20_transactions():
+    """
+    Забираем последние TRC20-транзакции для кошелька.
+    """
+    url = f"https://api.trongrid.io/v1/accounts/{WALLET_ADDRESS}/transactions/trc20?limit={TRON_TRANSACTIONS_LIMIT}"
+    headers = {"TRON-PRO-API-KEY": TRONGRID_API_KEY}
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers=headers) as resp:
+            if resp.status != 200:
+                logging.error(f"TronGrid error status: {resp.status}")
+                return []
+            data = await resp.json()
+    return data.get("data", [])
+
+
+def parse_trx_amount(tx: dict):
+    """
+    Достаём сумму USDT с транзакции.
+    """
+    raw_value = tx.get("value") or tx.get("amount")
+    if raw_value is None:
+        return None
+    try:
+        amount = int(raw_value) / 1_000_000  # 6 знаков после запятой
+        return amount
+    except Exception:
+        return None
+
+
+def parse_trx_time(tx: dict):
+    ts = tx.get("block_timestamp")
+    if not ts:
+        return ""
+    # TronGrid даёт timestamp в миллисекундах
+    dt = datetime.fromtimestamp(ts / 1000.0)
+    return dt.strftime("%Y-%m-%d %H:%M")
+
+
+def parse_trx_id(tx: dict):
+    return tx.get("transaction_id") or tx.get("txID") or ""
+
+
+# ==========================
+# ХЕНДЛЕРЫ
 # ==========================
 
 @dp.message_handler(commands=["start"])
 async def cmd_start(message: types.Message):
-    # Парсим рефералку: /start или /start ref_123
+    if not await anti_spam(message):
+        return
+
+    # Парсим /start ref_123
     referrer_id = None
     if message.get_args():
         args = message.get_args()
         if args.startswith("ref_"):
             try:
-                referrer_id = int(args.replace("ref_", ""))
+                candidate = int(args.replace("ref_", ""))
+                if candidate != message.from_user.id and candidate > 0:
+                    referrer_id = candidate
             except ValueError:
                 referrer_id = None
 
@@ -395,14 +526,14 @@ async def cmd_start(message: types.Message):
 
     text = (
         "👋 *Добро пожаловать в TradeX Partner Bot!*\n\n"
-        "Здесь собрано всё, чтобы ты мог:\n"
+        "Здесь всё, чтобы ты смог:\n"
         "• разобраться в трейдинге\n"
         "• получать торговые сигналы\n"
         "• научиться лить трафик из TikTok в Telegram\n"
         "• зарабатывать на партнёрке *50% + 10%*\n\n"
         "Ты платишь за доступ к системе *один раз — 100$*,\n"
-        "а дальше можешь зарабатывать на своих рефералах сколько захочешь.\n\n"
-        "2–3 активных человека уже могут вывести тебя в плюс.\n"
+        "а дальше используешь и продукт, и реферальку.\n\n"
+        "2–3 активных реферала уже могут вывести тебя в плюс.\n"
         "Выбирай действие ниже 👇"
     )
     await message.answer(text, reply_markup=main_keyboard())
@@ -412,12 +543,15 @@ async def cmd_start(message: types.Message):
 
 @dp.message_handler(Text(equals="🎓 Обучение трейдингу"))
 async def trading_education(message: types.Message):
+    if not await anti_spam(message):
+        return
+
     text = (
         "🎓 *Обучение трейдингу*\n\n"
-        "Это базовый курс, который даёт тебе понимание:\n"
+        "Это базовый курс, который даёт тебе фундамент:\n"
         "• что такое трейдинг\n"
         "• как не сливаться на эмоциях\n"
-        "• как грамотно работать с сигналами\n"
+        "• как работать с сигналами\n"
         "• как выстроить путь к стабильности\n\n"
         "Выбери блок ниже 👇"
     )
@@ -433,17 +567,21 @@ async def trading_lesson_callback(call: types.CallbackQuery):
         f"*{title}*\n\n{body}",
         reply_markup=lessons_keyboard(TRADING_LESSONS, "trading")
     )
+    await call.answer()
 
 
 # === ОБУЧЕНИЕ ТРАФИКУ ===
 
 @dp.message_handler(Text(equals="🚀 Обучение по трафику"))
 async def traffic_education(message: types.Message):
+    if not await anti_spam(message):
+        return
+
     text = (
         "🚀 *Обучение по переливу трафика из TikTok в Telegram*\n\n"
-        "Здесь ты узнаешь:\n"
+        "Ты узнаешь:\n"
         "• как оформить профиль TikTok под деньги\n"
-        "• какие видео снимать, даже если ты стесняешься камеры\n"
+        "• какие видео снимать\n"
         "• как вести людей в бота\n"
         "• как масштабировать трафик через несколько аккаунтов\n\n"
         "Выбери урок ниже 👇"
@@ -460,20 +598,23 @@ async def traffic_lesson_callback(call: types.CallbackQuery):
         f"*{title}*\n\n{body}",
         reply_markup=lessons_keyboard(TRAFFIC_LESSONS, "traffic")
     )
+    await call.answer()
 
 
 # === СИГНАЛЫ ===
 
 @dp.message_handler(Text(equals="📈 Сигналы"))
 async def signals_info(message: types.Message):
+    if not await anti_spam(message):
+        return
+
     text = (
         "📈 *Сигналы по трейдингу*\n\n"
         "После покупки доступа ты получаешь:\n"
-        "• доступ к закрытому сигнал-каналу\n"
+        "• вход в закрытый канал с сигналами\n"
         "• уведомления по основным входам\n"
-        "• структуру работы по сигналам из обучения\n\n"
-        "Наша цель — не 'угадать x100', а выстроить системную работу.\n\n"
-        "Чтобы попасть в закрытый канал — оформи доступ через «💰 Купить доступ»."
+        "• понятную структуру работы по сигналам из обучения\n\n"
+        "Чтобы попасть в закрытый канал — сначала оформи доступ через «💰 Купить доступ»."
     )
     await message.answer(text)
 
@@ -482,6 +623,9 @@ async def signals_info(message: types.Message):
 
 @dp.message_handler(Text(equals="🤝 Партнёрская программа"))
 async def partner_program(message: types.Message):
+    if not await anti_spam(message):
+        return
+
     user_row = get_user(message.from_user.id)
     if user_row is None:
         save_user(message.from_user)
@@ -501,13 +645,13 @@ async def partner_program(message: types.Message):
 
     text = (
         "🤝 *Партнёрская программа TradeX*\n\n"
-        "Ты можешь зарабатывать вместе с системой:\n\n"
+        "Ты зарабатываешь вместе с системой:\n\n"
         f"• *{REF_L1_PERCENT}%* (≈ {PRODUCT_PRICE_USD * REF_L1_PERCENT / 100:.0f}$) "
         f"с каждого, кого приведёшь лично\n"
         f"• *{REF_L2_PERCENT}%* (≈ {PRODUCT_PRICE_USD * REF_L2_PERCENT / 100:.0f}$) "
         f"со второго уровня — людей, которых приводят твои рефералы\n\n"
         "Пример:\n"
-        "— Ты привёл 3 человек → получил 3 × 50$ = 150$\n"
+        "— Ты привёл 3 человек → 3 × 50$ = 150$\n"
         "— Они привели ещё людей → ты докручиваешь по 10$ с каждого второго уровня.\n\n"
         f"Твоя реферальная ссылка:\n`{ref_link}`\n\n"
         "*Твоя статистика:*\n"
@@ -521,49 +665,89 @@ async def partner_program(message: types.Message):
     await message.answer(text)
 
 
-# === ПОКУПКА ДОСТУПА ===
+# === ПОКУПКА ДОСТУПА (с уникальной суммой) ===
 
 @dp.message_handler(Text(equals="💰 Купить доступ"))
 async def buy_access(message: types.Message):
+    if not await anti_spam(message):
+        return
+
     user_row = get_user(message.from_user.id)
     if user_row is None:
         save_user(message.from_user)
 
-    create_purchase(message.from_user.id, PRODUCT_PRICE_USD)
+    # генерируем уникальную сумму: 100.xxx
+    tail = random.randint(1, 999)
+    unique_amount = float(f"{PRODUCT_PRICE_USD}.{tail:03d}")
 
-    text = (
+    create_purchase(message.from_user.id, PRODUCT_PRICE_USD, unique_amount)
+
+    payment_text = (
         "💰 *Покупка доступа к системе TradeX*\n\n"
         "Один раз оплачиваешь доступ — и получаешь:\n"
         "• обучение по трейдингу\n"
         "• сигналы\n"
         "• обучение по переливу трафика из TikTok\n"
         "• партнёрскую программу 50% + 10%\n\n"
-        f"Стоимость доступа: *{PRODUCT_PRICE_USD}$*\n\n"
-        f"{PAYMENT_DETAILS}\n\n"
-        "После оплаты нажми кнопку *«✅ Я оплатил»*.\n"
-        "Админ проверит платёж и активирует тебе доступ.\n"
-        "Если хочешь ускорить — напиши админу и приложи скрин перевода."
+        f"Базовая цена: *{PRODUCT_PRICE_USD}$*\n"
+        f"Твоя уникальная сумма для оплаты: *{unique_amount} USDT*\n\n"
+        "⚠️ *Важно:* переведи ровно эту сумму до последнего знака.\n"
+        "По ней бот будет искать именно твой платёж.\n\n"
+        "Реквизиты:\n"
+        f"• Сеть: TRC-20\n"
+        f"• Кошелёк: `{WALLET_ADDRESS}`\n\n"
+        "После отправки перевода нажми «✅ Я оплатил».\n"
+        "Бот сначала попробует найти платёж автоматически.\n"
+        f"Если что-то не так — можешь написать в поддержку: {SUPPORT_CONTACT}"
     )
 
     kb = ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row(KeyboardButton("✅ Я оплатил"), KeyboardButton("⬅️ В меню"))
-    await message.answer(text, reply_markup=kb)
-    await log_to_admin(f"Новая заявка на оплату от {message.from_user.id}")
+    await message.answer(payment_text, reply_markup=kb)
+    await log_to_admin(
+        f"Новая заявка на оплату от {message.from_user.id}. Уникальная сумма: {unique_amount} USDT."
+    )
 
 
 @dp.message_handler(Text(equals="✅ Я оплатил"))
 async def i_paid(message: types.Message):
+    if not await anti_spam(message):
+        return
+
     await message.answer(
-        "✅ Отлично! Мы получили сигнал, что ты оплатил.\n"
-        "Админ скоро проверит платёж и активирует тебе доступ.\n\n"
-        f"Если хочешь ускорить — напиши в поддержку: {SUPPORT_CONTACT}",
-        reply_markup=main_keyboard(),
+        "⏳ Проверяю платёж по твоей уникальной сумме...\n"
+        "Обычно это занимает до 10–30 секунд.",
     )
-    await log_to_admin(f"Пользователь {message.from_user.id} нажал 'Я оплатил'.")
+
+    purchase = get_last_pending_purchase(message.from_user.id)
+    if not purchase:
+        await message.answer(
+            "❓ У тебя нет активной заявки на оплату.\n"
+            "Если ты уже платил — напиши админу и отправь скрин перевода."
+        )
+        return
+
+    pid, uid, base_amount, unique_amount, status, created_at, confirmed_at, tx_amount, tx_time, tx_id = purchase
+
+    found = await check_payment_for_purchase(purchase)
+    if found:
+        await after_success_payment(purchase, manual_check=True)
+    else:
+        await message.answer(
+            "❌ Пока не вижу платёж с твоей уникальной суммой.\n"
+            "Если ты только что отправил — подожди 1–2 минуты и нажми ещё раз.\n"
+            f"Если есть сомнения — напиши в поддержку: {SUPPORT_CONTACT}",
+            reply_markup=main_keyboard(),
+        )
+        await log_to_admin(
+            f"Пользователь {message.from_user.id} нажал 'Я оплатил', но платёж не найден автоматически."
+        )
 
 
 @dp.message_handler(Text(equals="⬅️ В меню"))
 async def back_to_menu(message: types.Message):
+    if not await anti_spam(message):
+        return
     await message.answer("🏠 Главное меню", reply_markup=main_keyboard())
 
 
@@ -571,6 +755,9 @@ async def back_to_menu(message: types.Message):
 
 @dp.message_handler(Text(equals="👤 Мой профиль"))
 async def profile(message: types.Message):
+    if not await anti_spam(message):
+        return
+
     user_row = get_user(message.from_user.id)
     if user_row is None:
         save_user(message.from_user)
@@ -587,6 +774,7 @@ async def profile(message: types.Message):
         lvl1,
         lvl2,
         withdrawn,
+        has_access,
     ) = user_row
 
     cursor.execute(
@@ -595,6 +783,8 @@ async def profile(message: types.Message):
     )
     cnt_purchases = cursor.fetchone()[0]
 
+    status_access = "🟢 Есть доступ к системе" if has_access else "🔴 Доступ не активирован"
+
     text = (
         "👤 *Твой профиль:*\n\n"
         f"ID: `{user_id}`\n"
@@ -602,7 +792,8 @@ async def profile(message: types.Message):
         f"Имя: {full_name or '—'}\n\n"
         f"Первый вход: {first_seen}\n"
         f"Последняя активность: {last_active}\n\n"
-        f"Оплаченных доступов: *{cnt_purchases}*\n"
+        f"{status_access}\n"
+        f"Оплаченных доступов: *{cnt_purchases}*\n\n"
         f"Баланс: *{balance:.2f}$*\n"
         f"1 уровень заработано: *{lvl1:.2f}$*\n"
         f"2 уровень заработано: *{lvl2:.2f}$*\n"
@@ -629,7 +820,7 @@ async def admin_all_users(message: types.Message):
         return
 
     cursor.execute(
-        "SELECT user_id, username, full_name, first_seen, last_active "
+        "SELECT user_id, username, full_name, first_seen, last_active, has_access "
         "FROM users ORDER BY first_seen DESC"
     )
     rows = cursor.fetchall()
@@ -638,9 +829,10 @@ async def admin_all_users(message: types.Message):
         return await message.answer("Пока нет пользователей.")
 
     text_parts = ["👥 *Все пользователи:*\n\n"]
-    for uid, username, full_name, first_seen, last_active in rows:
+    for uid, username, full_name, first_seen, last_active, has_access in rows:
+        status_access = "🟢" if has_access else "🔴"
         text_parts.append(
-            f"ID: `{uid}`\n"
+            f"{status_access} ID: `{uid}`\n"
             f"Username: @{username if username else '—'}\n"
             f"Имя: {full_name or '—'}\n"
             f"Первый вход: {first_seen}\n"
@@ -659,7 +851,7 @@ async def admin_purchases(message: types.Message):
         return
 
     cursor.execute(
-        "SELECT id, user_id, amount, status, created_at, confirmed_at "
+        "SELECT id, user_id, base_amount, unique_amount, status, created_at, confirmed_at, tx_amount, tx_time "
         "FROM purchases ORDER BY created_at DESC LIMIT 50"
     )
     rows = cursor.fetchall()
@@ -668,14 +860,17 @@ async def admin_purchases(message: types.Message):
         return await message.answer("Покупок пока нет.")
 
     text_parts = ["🧾 *Последние покупки:*\n\n"]
-    for pid, uid, amount, status, created_at, confirmed_at in rows:
+    for pid, uid, base_amount, unique_amount, status, created_at, confirmed_at, tx_amount, tx_time in rows:
         text_parts.append(
             f"ID покупки: `{pid}`\n"
             f"Пользователь: `{uid}`\n"
-            f"Сумма: {amount}$\n"
+            f"Базовая сумма: {base_amount}$\n"
+            f"Уникальная сумма: {unique_amount} USDT\n"
             f"Статус: *{status}*\n"
             f"Создано: {created_at}\n"
             f"Подтверждено: {confirmed_at or '—'}\n"
+            f"Tx сумма: {tx_amount or 0} USDT\n"
+            f"Tx время: {tx_time or '—'}\n"
             "─────────────\n"
         )
 
@@ -717,35 +912,19 @@ async def admin_ref_earnings(message: types.Message):
         await message.answer(text[i:i+4000])
 
 
-@dp.message_handler(commands=["confirm"])
-async def admin_confirm_purchase(message: types.Message):
-    """Подтверждение оплаты: /confirm <ID_покупки>"""
-    if not is_admin(message.from_user.id):
-        return
+# ==========================
+# ЛОГИКА ПОСЛЕ ОПЛАТЫ
+# ==========================
 
-    parts = message.text.split()
-    if len(parts) < 2:
-        return await message.answer("Использование: /confirm <ID_покупки>")
+async def after_success_payment(purchase_row, manual_check: bool = False):
+    """
+    Вызывается, когда мы подтвердили платёж (авто или руками).
+    Начисляет рефералку, даёт доступ, ссылку в канал.
+    """
+    pid, uid, base_amount, unique_amount, status, created_at, confirmed_at, tx_amount, tx_time, tx_id = purchase_row
 
-    try:
-        purchase_id = int(parts[1])
-    except ValueError:
-        return await message.answer("ID покупки должен быть числом.")
-
-    cursor.execute(
-        "SELECT id, user_id, amount, status FROM purchases WHERE id = ?",
-        (purchase_id,),
-    )
-    row = cursor.fetchone()
-    if not row:
-        return await message.answer("Покупка с таким ID не найдена.")
-
-    pid, uid, amount, status = row
-    if status == "confirmed":
-        return await message.answer("Эта покупка уже подтверждена.")
-
-    # подтверждаем покупку
-    confirm_purchase(pid)
+    # ставим доступ
+    set_access(uid, True)
 
     # реферальные начисления
     cursor.execute("SELECT referrer_id FROM users WHERE user_id = ?", (uid,))
@@ -753,39 +932,136 @@ async def admin_confirm_purchase(message: types.Message):
     ref1 = ref_row[0] if ref_row else None
 
     if ref1:
-        bonus1 = amount * REF_L1_PERCENT / 100
+        bonus1 = base_amount * REF_L1_PERCENT / 100
         add_referral_bonus(ref1, uid, level=1, bonus=bonus1)
 
-        # второй уровень
         cursor.execute("SELECT referrer_id FROM users WHERE user_id = ?", (ref1,))
         ref2_row = cursor.fetchone()
         ref2 = ref2_row[0] if ref2_row else None
 
         if ref2:
-            bonus2 = amount * REF_L2_PERCENT / 100
+            bonus2 = base_amount * REF_L2_PERCENT / 100
             add_referral_bonus(ref2, uid, level=2, bonus=bonus2)
 
-    await message.answer(f"✅ Покупка {pid} от пользователя {uid} подтверждена.")
+    # отправляем ссылку в закрытый канал
+    try:
+        invite = await bot.create_chat_invite_link(CHANNEL_ID, member_limit=1)
+        link_text = f"🔗 Твоя личная ссылка в закрытый канал:\n{invite.invite_link}"
+    except Exception as e:
+        logging.error(f"Ошибка создания инвайта: {e}")
+        link_text = (
+            "Не удалось автоматически создать ссылку в канал.\n"
+            "Напиши админу, он выдаст доступ вручную."
+        )
+
     try:
         await bot.send_message(
             uid,
-            "✅ Твоя оплата подтверждена!\n\n"
-            "Доступ к системе активирован.\n"
-            "Можешь изучать обучение, подключаться к сигналам и начинать заливать трафик.\n\n"
-            "И не забудь поделиться своей реферальной ссылкой — партнёрка 50% + 10%.",
+            "✅ *Оплата найдена и подтверждена!*\n\n"
+            "Тебе активирован доступ к системе:\n"
+            "• обучение по трейдингу\n"
+            "• сигналы\n"
+            "• обучение по трафику\n"
+            "• партнёрская программа 50% + 10%\n\n"
+            + link_text,
         )
     except Exception:
         pass
 
-    await log_to_admin(f"Покупка {pid} подтверждена. Пользователь {uid}.")
+    await log_to_admin(
+        f"Успешная оплата. Пользователь {uid}, покупка {pid}, сумма {base_amount}$, уникальная {unique_amount}."
+    )
 
+
+async def check_payment_for_purchase(purchase_row):
+    """
+    Проверка конкретной заявки по данным с TronGrid.
+    Возвращает True, если платёж найден и обновлён в БД.
+    """
+    pid, uid, base_amount, unique_amount, status, created_at, confirmed_at, tx_amount, tx_time, tx_id = purchase_row
+
+    txs = await fetch_trc20_transactions()
+    if not txs:
+        return False
+
+    created_dt = datetime.strptime(created_at, "%Y-%m-%d %H:%M")
+
+    for tx in txs:
+        # токен должен быть USDT и получатель наш кошелёк
+        token_info = tx.get("token_info") or {}
+        symbol = token_info.get("symbol")
+        to_addr = tx.get("to", "").lower()
+        if symbol and symbol.upper() != "USDT":
+            continue
+        if to_addr and to_addr != WALLET_ADDRESS.lower():
+            continue
+
+        amount = parse_trx_amount(tx)
+        if amount is None:
+            continue
+
+        # совпадение по уникальной сумме
+        if abs(amount - unique_amount) > 0.0000001:
+            continue
+
+        tx_time_str = parse_trx_time(tx)
+        tx_dt = None
+        if tx_time_str:
+            try:
+                tx_dt = datetime.strptime(tx_time_str, "%Y-%m-%d %H:%M")
+            except Exception:
+                tx_dt = None
+
+        # не принимаем транзакции, которые сильно старше заявки (анти-фрод)
+        if tx_dt and tx_dt < created_dt:
+            continue
+
+        txid = parse_trx_id(tx)
+        # проверяем, не использовался ли tx_id ранее
+        if txid:
+            cursor.execute(
+                "SELECT COUNT(*) FROM purchases WHERE tx_id = ? AND status = 'confirmed'",
+                (txid,),
+            )
+            if cursor.fetchone()[0] > 0:
+                continue
+
+        # если дошли сюда — считаем, что нашли платёж
+        confirm_purchase_record(pid, amount, tx_time_str, txid)
+        return True
+
+    return False
+
+
+# ==========================
+# ФОНОВАЯ ПРОВЕРКА ПЛАТЕЖЕЙ
+# ==========================
+
+async def periodic_auto_check_payments():
+    await bot.send_message(ADMIN_ID, "🔄 Авто-проверка платежей запущена.")
+    while True:
+        try:
+            pending = get_all_pending_purchases()
+            if pending:
+                logging.info(f"Автопроверка платежей. Заявок в статусе pending: {len(pending)}")
+            for purchase in pending:
+                found = await check_payment_for_purchase(purchase)
+                if found:
+                    await after_success_payment(purchase, manual_check=False)
+        except Exception as e:
+            logging.error(f"Ошибка в periodic_auto_check_payments: {e}")
+        await asyncio.sleep(PAYMENT_SCAN_INTERVAL)
 
 # ==========================
 # ЗАПУСК
 # ==========================
 
+import asyncio
+
 async def on_startup(dispatcher):
     await log_to_admin("✅ Бот TradeX Partner Bot запущен.")
+    asyncio.create_task(periodic_auto_check_payments())
+
 
 if __name__ == "__main__":
     executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
