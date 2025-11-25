@@ -714,46 +714,40 @@ async def buy_access(message: types.Message):
     )
 
 
-@dp.message_handler(Text(equals="✅ Я оплатил"))
-async def i_paid(message: types.Message):
-    if not await anti_spam(message):
-        return
-
-    await message.answer(
-        "⏳ Проверяю платёж по твоей уникальной сумме...\n"
-        "Обычно это занимает до 10–30 секунд.",
-    )
-
+@dp.message_handler(lambda m: m.text == "Я оплатил ✔️")
+async def check_user_payment(message: types.Message):
     purchase = get_last_pending_purchase(message.from_user.id)
+
     if not purchase:
         await message.answer(
-            "❓ У тебя нет активной заявки на оплату.\n"
+            "❗ У тебя нет активной заявки на оплату.\n"
             "Если ты уже платил — напиши админу и отправь скрин перевода."
         )
         return
 
     pid, uid, base_amount, unique_amount, status, created_at, confirmed_at, tx_amount, tx_time, tx_id = purchase
 
-    # вызов проверки оплаты
+    # ✔️ ОБЯЗАТЕЛЬНО ВНУТРИ ФУНКЦИИ
     found = await check_payment_for_purchase(purchase)
 
     if found:
         await after_success_payment(purchase, manual_check=True)
 
     else:
-    # оставляем ту же клавиатуру, чтобы можно было нажимать "Я оплатил" сколько угодно
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row(KeyboardButton("✅ Я оплатил"), KeyboardButton("⬅️ В меню"))
+        kb = ReplyKeyboardMarkup(resize_keyboard=True)
+        kb.row(
+            KeyboardButton("✔ Я оплатил"),
+            KeyboardButton("← В меню")
+        )
+        await message.answer(
+            "✖ Пока не вижу платёж с твоей уникальной суммой.\n"
+            "Если ты только что отправил — подожди 1–2 минуты и нажми ещё раз.\n"
+            f"Если есть сомнения — напиши в поддержку: {SUPPORT_CONTACT}",
+            reply_markup=kb,
+        )
 
-    await message.answer(
-        "❌ Пока не вижу платёж с твоей уникальной суммой.\n"
-        "Если ты только что отправил — подожди 1–2 минуты и нажми ещё раз.\n"
-        f"Если есть сомнения — напиши в поддержку: {SUPPORT_CONTACT}",
-        reply_markup=kb,
-    )
-    await log_to_admin(
-        f"Пользователь {message.from_user.id} нажал 'Я оплатил', но платёж не найден автоматически."
-    )
+    await log_to_admin(message)
+
 
 
 
