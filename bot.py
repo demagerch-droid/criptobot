@@ -17,8 +17,8 @@ from aiogram.contrib.middlewares.logging import LoggingMiddleware
 # НАСТРОЙКИ
 # ---------------------------------------------------------------------------
 
-BOT_TOKEN = os.getenv("8330326273:AAEuWSwkqi7ypz1LZL4LXRr2jSMpKjGc36k")
-ADMIN_ID = int(os.getenv("682938643", "0"))
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT", "@support")
 
 PRICE_USD = 100  # стоимость продукта в долларах
@@ -307,4 +307,522 @@ COURSE = {
             "• условия выхода\n"
             "• управление риском\n"
             "• понятное время для торговли.\n\n"
-        ]
+            "Всё остальное – детали реализации.",
+
+            "📈 <b>Урок 2. Наша базовая идея</b>\n\n"
+            "Мы работаем по тренду и забираем самые понятные участки движения. Без угадывания разворотов и игры "
+            "против сильного движения.",
+
+            "📈 <b>Урок 3. Домашка</b>\n\n"
+            "Открой график любой монеты и попробуй глазами найти места, где тренд уже сформирован, а вход в продолжение "
+            "движения был бы логичным. Привыкай думать категориями вероятностей.",
+        ],
+    ),
+}
+
+# ---------------------------------------------------------------------------
+# КЛАВИАТУРЫ
+# ---------------------------------------------------------------------------
+
+
+def main_menu():
+    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row(KeyboardButton("🎓 Обучение трейдингу"))
+    kb.row(
+        KeyboardButton("📈 Сигналы по торговле"),
+        KeyboardButton("💼 Комбо: обучение + сигналы"),
+    )
+    kb.row(
+        KeyboardButton("👥 Партнёрская программа"),
+        KeyboardButton("📊 Моя статистика"),
+    )
+    kb.row(KeyboardButton("📩 Поддержка"))
+    return kb
+
+
+def training_menu_keyboard():
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("▶️ Начать / продолжить обучение", callback_data="train_start"))
+    kb.add(InlineKeyboardButton("📚 Структура курса", callback_data="train_structure"))
+    kb.add(InlineKeyboardButton("⬅️ В главное меню", callback_data="back_main"))
+    return kb
+
+
+def modules_keyboard():
+    kb = InlineKeyboardMarkup()
+    for key, (title, _lessons) in COURSE.items():
+        kb.add(InlineKeyboardButton(title, callback_data=f"module:{key}:0"))
+    kb.add(InlineKeyboardButton("⬅️ Назад в обучение", callback_data="back_training"))
+    return kb
+
+
+def lesson_nav_keyboard(module_key: str, index: int, last: bool):
+    kb = InlineKeyboardMarkup()
+    if index > 0:
+        kb.insert(InlineKeyboardButton("⬅️ Назад", callback_data=f"lesson:{module_key}:{index - 1}"))
+    if not last:
+        kb.insert(InlineKeyboardButton("Дальше ▶️", callback_data=f"lesson:{module_key}:{index + 1}"))
+    kb.add(InlineKeyboardButton("🏁 Меню обучения", callback_data="back_training"))
+    return kb
+
+
+def pay_keyboard(purchase_id: int):
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("✅ Я оплатил", callback_data=f"paid:{purchase_id}"))
+    kb.add(InlineKeyboardButton("⬅️ В главное меню", callback_data="back_main"))
+    return kb
+
+
+def back_main_inline():
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("⬅️ В главное меню", callback_data="back_main"))
+    return kb
+
+
+# ---------------------------------------------------------------------------
+# ХЭНДЛЕРЫ
+# ---------------------------------------------------------------------------
+
+
+@dp.message_handler(commands=["start"])
+async def cmd_start(message: types.Message):
+    if is_spam(message.from_user.id):
+        return
+
+    # парсим реферальный код
+    args = message.get_args() or ""
+    referrer_id = None
+    if args.startswith("ref_"):
+        try:
+            referrer_tg_id = int(args.split("_", 1)[1])
+            if referrer_tg_id != message.from_user.id:
+                # найдём referrer в БД
+                conn = db_connect()
+                cur = conn.cursor()
+                cur.execute("SELECT id FROM users WHERE user_id = ?", (referrer_tg_id,))
+                row = cur.fetchone()
+                conn.close()
+                if row:
+                    referrer_id = row[0]
+        except Exception:
+            pass
+
+    get_or_create_user(message, referrer_id)
+
+    me = await bot.get_me()
+    ref_link = f"https://t.me/{me.username}?start=ref_{message.from_user.id}"
+
+    text = (
+        "👋 <b>Добро пожаловать в TradeX Partner Bot!</b>\n\n"
+        "Здесь ты получишь:\n"
+        "• Обучение трейдингу с нуля до уверенного понимания рынка.\n"
+        "• Закрытые сигналы по торговле.\n"
+        "• Пошаговый разбор, как переливать трафик из TikTok в Telegram.\n"
+        "• Двухуровневую партнёрку: <b>50%</b> с личных продаж и <b>10%</b> со второго уровня.\n\n"
+        "Твоя личная реферальная ссылка:\n"
+        f"<code>{ref_link}</code>\n\n"
+        "Выбирай нужный раздел в меню 👇"
+    )
+
+    await message.answer(text, reply_markup=main_menu())
+
+
+@dp.message_handler(lambda m: m.text == "📩 Поддержка")
+async def support_handler(message: types.Message):
+    if is_spam(message.from_user.id):
+        return
+    await message.answer(
+        f"Если возникли вопросы по оплате или работе бота – пиши в поддержку: {SUPPORT_CONTACT}",
+        reply_markup=main_menu(),
+    )
+
+
+# -------------------- ОБУЧЕНИЕ -------------------- #
+
+
+@dp.message_handler(lambda m: m.text == "🎓 Обучение трейдингу")
+async def training_menu(message: types.Message):
+    if is_spam(message.from_user.id):
+        return
+    await message.answer(
+        "🎓 <b>Обучение трейдингу</b>\n\n"
+        "Это пошаговый курс, который можно проходить в удобном темпе. "
+        "Каждый модуль раскрывает отдельный блок: психология, риск-менеджмент, сама стратегия.\n\n"
+        "Выбери действие:",
+        reply_markup=training_menu_keyboard(),
+    )
+
+
+@dp.callback_query_handler(lambda c: c.data == "back_training")
+async def cb_back_training(call: CallbackQuery):
+    await call.message.edit_text(
+        "🎓 <b>Обучение трейдингу</b>\n\n"
+        "Выбери действие:",
+        reply_markup=training_menu_keyboard(),
+    )
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data == "train_structure")
+async def cb_train_structure(call: CallbackQuery):
+    text_lines = ["📚 <b>Структура курса:</b>\n"]
+    for _title_key, (title, lessons) in COURSE.items():
+        text_lines.append(f"• {title} — {len(lessons)} урок(ов)")
+    text_lines.append("\nНажми «Начать / продолжить обучение», чтобы перейти к урокам.")
+    await call.message.edit_text("\n".join(text_lines), reply_markup=training_menu_keyboard())
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data == "train_start")
+async def cb_train_start(call: CallbackQuery):
+    user_id = call.from_user.id
+    module_key, lesson_index = get_progress(user_id)
+
+    # если прогресса нет – начинаем с первого модуля
+    if not module_key or module_key not in COURSE:
+        module_key = list(COURSE.keys())[0]
+        lesson_index = 0
+
+    await send_lesson(call.message, user_id, module_key, lesson_index, edit=True)
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("module:"))
+async def cb_choose_module(call: CallbackQuery):
+    _, module_key, _ = call.data.split(":")
+    await send_lesson(call.message, call.from_user.id, module_key, 0, edit=True)
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("lesson:"))
+async def cb_lesson_nav(call: CallbackQuery):
+    _, module_key, index_str = call.data.split(":")
+    index = int(index_str)
+    await send_lesson(call.message, call.from_user.id, module_key, index, edit=True)
+    await call.answer()
+
+
+async def send_lesson(message: types.Message, user_id: int, module_key: str, index: int, edit: bool = False):
+    if module_key not in COURSE:
+        return
+
+    title, lessons = COURSE[module_key]
+    index = max(0, min(index, len(lessons) - 1))
+    lesson_text = lessons[index]
+    header = f"🎓 <b>{title}</b>\nУрок {index + 1} из {len(lessons)}\n\n"
+
+    last = index == len(lessons) - 1
+    kb = lesson_nav_keyboard(module_key, index, last)
+
+    # сохраняем прогресс по Telegram ID пользователя
+    set_progress(user_id, module_key, index)
+
+    if edit:
+        await message.edit_text(header + lesson_text, reply_markup=kb)
+    else:
+        await message.answer(header + lesson_text, reply_markup=kb)
+
+
+@dp.callback_query_handler(lambda c: c.data == "back_main")
+async def cb_back_main(call: CallbackQuery):
+    await call.message.edit_text("Главное меню обновлено 👇", reply_markup=back_main_inline())
+    # и просто отправим отдельным сообщением меню
+    await call.message.answer("Выбери нужный раздел:", reply_markup=main_menu())
+    await call.answer()
+
+
+# -------------------- ПРОДУКТ И ОПЛАТА -------------------- #
+
+
+@dp.message_handler(lambda m: m.text in ["💼 Комбо: обучение + сигналы", "📈 Сигналы по торговле"])
+async def combo_product(message: types.Message):
+    if is_spam(message.from_user.id):
+        return
+
+    user_row = get_user_by_user_id(message.from_user.id)
+    if not user_row:
+        get_or_create_user(message)
+
+    description = (
+        "💼 <b>Комбо-продукт: обучение + сигналы</b>\n\n"
+        "Что входит:\n"
+        "• Полное обучение трейдингу внутри бота.\n"
+        "• Доступ к закрытым сигналам по торговле.\n"
+        "• Обучение по переливу трафика из TikTok в Telegram.\n\n"
+        f"Стоимость доступа: <b>{PRICE_USD}$</b> (единожды).\n\n"
+        "После оплаты ты получаешь пожизненный доступ к материалам и можешь "
+        "зарабатывать по партнёрке: 50% с личных продаж и 10% со второго уровня."
+    )
+
+    user_db_row = get_user_by_user_id(message.from_user.id)
+    if not user_db_row:
+        user_db_id = get_or_create_user(message)
+    else:
+        user_db_id = user_db_row[0]
+
+    purchase_id = create_purchase(user_db_id, "combo", PRICE_USD)
+
+    pay_text = (
+        description
+        + "\n\n<b>Как оплатить:</b>\n"
+          "1. Переведи <b>100$</b> на реквизиты, которые тебе даст админ или бот (USDT, карта и т.д.).\n"
+          "2. Обязательно укажи в комментарии/примечании слово: "
+        f"<code>TX{purchase_id}</code>\n"
+        "3. После перевода нажми кнопку «Я оплатил» ниже.\n\n"
+        "Админ сверит транзакцию и бот автоматически выдаст доступ."
+    )
+
+    await message.answer(pay_text, reply_markup=pay_keyboard(purchase_id))
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("paid:"))
+async def cb_paid(call: CallbackQuery):
+    """
+    Пользователь нажал «Я оплатил».
+    """
+    _, purchase_id_str = call.data.split(":")
+    purchase_id = int(purchase_id_str)
+
+    # найдём покупку
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT p.id, p.user_id, u.user_id, u.username, u.first_name, p.amount, p.status "
+        "FROM purchases p JOIN users u ON p.user_id = u.id WHERE p.id = ?",
+        (purchase_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+
+    if not row:
+        await call.answer("Заявка на оплату не найдена. Напиши в поддержку.", show_alert=True)
+        return
+
+    _, user_db_id, tg_id, username, first_name, amount, status = row
+
+    if status == "paid":
+        await call.answer("Эта оплата уже подтверждена ✅", show_alert=True)
+        return
+
+    user_mention = f"<a href='tg://user?id={tg_id}'>{first_name}</a>"
+    uname = f"@{username}" if username else ""
+
+    text_for_admin = (
+        "💳 <b>Новая заявка на оплату</b>\n\n"
+        f"Пользователь: {user_mention} {uname}\n"
+        f"Telegram ID: <code>{tg_id}</code>\n"
+        f"ID записи в БД: <code>{user_db_id}</code>\n"
+        f"Сумма: <b>{amount}$</b>\n"
+        f"ID покупки: <code>{purchase_id}</code>\n\n"
+        "Если оплата пришла – нажми кнопку ниже, и бот сам начислит партнёрские."
+    )
+
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("✅ Подтвердить оплату", callback_data=f"confirm:{purchase_id}"))
+
+    await bot.send_message(ADMIN_ID, text_for_admin, reply_markup=kb)
+    await call.message.answer(
+        "✅ Заявка отправлена администратору.\n\n"
+        "Как только оплата будет подтверждена, бот выдаст доступ и начислит бонусы по партнёрке.",
+        reply_markup=main_menu(),
+    )
+    await call.answer("Заявка отправлена админу", show_alert=True)
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("confirm:"), user_id=ADMIN_ID)
+async def cb_confirm_payment(call: CallbackQuery):
+    """
+    Админ нажимает кнопку подтверждения.
+    """
+    _, purchase_id_str = call.data.split(":")
+    purchase_id = int(purchase_id_str)
+
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT p.id, p.user_id, u.user_id, u.first_name, p.amount, p.status "
+        "FROM purchases p JOIN users u ON p.user_id = u.id WHERE p.id = ?",
+        (purchase_id,),
+    )
+    row = cur.fetchone()
+
+    if not row:
+        await call.answer("Покупка не найдена", show_alert=True)
+        conn.close()
+        return
+
+    _, user_db_id, buyer_tg_id, buyer_first_name, amount, status = row
+
+    if status == "paid":
+        await call.answer("Уже подтверждено ✅", show_alert=True)
+        conn.close()
+        return
+
+    # помечаем как оплачено
+    mark_purchase_paid(purchase_id, tx_id="manual_admin_confirm")
+
+    # реферальные начисления
+    lvl1_id, lvl2_id = get_referrer_chain(user_db_id)
+
+    lvl1_bonus = amount * LEVEL1_PERCENT
+    lvl2_bonus = amount * LEVEL2_PERCENT
+
+    if lvl1_id:
+        add_balance(lvl1_id, lvl1_bonus)
+
+    if lvl2_id:
+        add_balance(lvl2_id, lvl2_bonus)
+
+    conn.close()
+
+    # уведомляем покупателя
+    try:
+        await bot.send_message(
+            buyer_tg_id,
+            "✅ <b>Оплата подтверждена!</b>\n\n"
+            "Доступ к обучению и сигналам открыт. Кнопки для перехода в разделы уже доступны в главном меню.",
+            reply_markup=main_menu(),
+        )
+    except Exception:
+        pass
+
+    # уведомляем рефералов
+    if lvl1_id:
+        conn = db_connect()
+        cur = conn.cursor()
+        cur.execute("SELECT user_id FROM users WHERE id = ?", (lvl1_id,))
+        r1 = cur.fetchone()
+        conn.close()
+        if r1:
+            lvl1_tg = r1[0]
+            try:
+                await bot.send_message(
+                    lvl1_tg,
+                    f"💰 <b>Начислено {lvl1_bonus}$</b> за личную рекомендацию.\n"
+                    f"Твой партнёр {buyer_first_name} совершил покупку на {amount}$."
+                )
+            except Exception:
+                pass
+
+    if lvl2_id:
+        conn = db_connect()
+        cur = conn.cursor()
+        cur.execute("SELECT user_id FROM users WHERE id = ?", (lvl2_id,))
+        r2 = cur.fetchone()
+        conn.close()
+        if r2:
+            lvl2_tg = r2[0]
+            try:
+                await bot.send_message(
+                    lvl2_tg,
+                    f"💸 <b>Начислено {lvl2_bonus}$</b> со второго уровня.\n"
+                    f"Партнёр второго уровня совершил покупку на {amount}$."
+                )
+            except Exception:
+                pass
+
+    await call.answer("Оплата подтверждена, бонусы начислены ✅", show_alert=True)
+    await call.message.edit_reply_markup()  # убираем кнопки под заявкой
+
+
+# -------------------- ПАРТНЁРКА И СТАТИСТИКА -------------------- #
+
+
+@dp.message_handler(lambda m: m.text == "👥 Партнёрская программа")
+async def partners_handler(message: types.Message):
+    if is_spam(message.from_user.id):
+        return
+
+    user = get_user_by_user_id(message.from_user.id)
+    if not user:
+        get_or_create_user(message)
+        user = get_user_by_user_id(message.from_user.id)
+
+    user_db_id, _, username, first_name, referrer_id, balance, total_earned = user
+
+    me = await bot.get_me()
+    ref_link = f"https://t.me/{me.username}?start=ref_{message.from_user.id}"
+
+    text = (
+        "👥 <b>Партнёрская программа TradeX</b>\n\n"
+        "Ты можешь зарабатывать на рекомендациях нашего продукта:\n"
+        f"• <b>50%</b> с каждой продажи по твоей ссылке.\n"
+        f"• <b>10%</b> с продаж партнёров второго уровня.\n\n"
+        "Пример:\n"
+        "Ты привёл друга – он купил доступ за 100$ → ты получил 50$.\n"
+        "Друг привёл ещё человека → он получил 50$, а ты +10$ сверху.\n\n"
+        "Твоя личная ссылка:\n"
+        f"<code>{ref_link}</code>\n\n"
+        f"Текущий баланс к выводу: <b>{balance}$</b>\n"
+        f"Всего заработано за всё время: <b>{total_earned}$</b>\n\n"
+        "Вывод средств делается через администратора. Напиши в поддержку, когда захочешь вывести прибыль."
+    )
+
+    await message.answer(text, reply_markup=main_menu())
+
+
+@dp.message_handler(lambda m: m.text == "📊 Моя статистика")
+async def my_stats(message: types.Message):
+    if is_spam(message.from_user.id):
+        return
+
+    user = get_user_by_user_id(message.from_user.id)
+    if not user:
+        await message.answer(
+            "Пока нет данных. Нажми /start, чтобы зарегистрироваться.",
+            reply_markup=main_menu(),
+        )
+        return
+
+    user_db_id = user[0]
+
+    conn = db_connect()
+    cur = conn.cursor()
+
+    cur.execute("SELECT COUNT(*) FROM users WHERE referrer_id = ?", (user_db_id,))
+    lvl1_count = cur.fetchone()[0]
+
+    cur.execute(
+        "SELECT COUNT(*) FROM users WHERE referrer_id IN (SELECT id FROM users WHERE referrer_id = ?)",
+        (user_db_id,),
+    )
+    lvl2_count = cur.fetchone()[0]
+
+    conn.close()
+
+    _, _, username, first_name, _, balance, total_earned = user
+
+    text = (
+        "📊 <b>Твоя статистика</b>\n\n"
+        f"Имя: <b>{first_name}</b>\n"
+        f"Логин: @{username if username else '—'}\n\n"
+        f"Партнёров 1 уровня: <b>{lvl1_count}</b>\n"
+        f"Партнёров 2 уровня: <b>{lvl2_count}</b>\n\n"
+        f"Баланс к выводу: <b>{balance}$</b>\n"
+        f"Всего заработано: <b>{total_earned}$</b>\n\n"
+        "Продолжай делиться ссылкой и зарабатывай больше 💸"
+    )
+
+    await message.answer(text, reply_markup=main_menu())
+
+
+# -------------------- ПРОЧЕЕ -------------------- #
+
+
+@dp.message_handler()
+async def fallback(message: types.Message):
+    if is_spam(message.from_user.id):
+        return
+    await message.answer("Не понял сообщение 🤔\nВыбери пункт в меню ниже.", reply_markup=main_menu())
+
+
+# ---------------------------------------------------------------------------
+# ЗАПУСК
+# ---------------------------------------------------------------------------
+
+
+if __name__ == "__main__":
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN не задан в переменных окружения")
+    init_db()
+    executor.start_polling(dp, skip_updates=True)
