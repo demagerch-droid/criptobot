@@ -17,9 +17,9 @@ from aiogram.contrib.middlewares.logging import LoggingMiddleware
 # НАСТРОЙКИ
 # ---------------------------------------------------------------------------
 
-BOT_TOKEN = os.getenv("8330326273:AAEw5wkqi7rypz1LZL4LXRr2j5MpKjGc36k")
-ADMIN_ID = int(os.getenv("682938643", "0"))
-SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT", "@support")
+BOT_TOKEN = "8330326273:AAEw5wkqi7rypz1LZL4LXRr2j5MpKjGc36k"
+ADMIN_ID = 682938643
+SUPPORT_CONTACT = "@support"  # или твой логин поддержки
 
 PRICE_USD = 100  # стоимость продукта в долларах
 LEVEL1_PERCENT = 0.5   # 50% первому уровню
