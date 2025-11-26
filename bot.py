@@ -695,14 +695,14 @@ async def cb_train_start(call: types.CallbackQuery):
         module_key = list(COURSE.keys())[0]
         lesson_index = 0
 
-    await send_lesson(call.message, user_id, module_key, lesson_index, edit=False)
+    await send_lesson(call.message, user_id, module_key, lesson_index)
     await call.answer()
 
 
 @dp.callback_query_handler(lambda c: c.data.startswith("module:"))
 async def cb_module(call: types.CallbackQuery):
     _, module_key, _ = call.data.split(":")
-    await send_lesson(call.message, call.from_user.id, module_key, 0, edit=False)
+    await send_lesson(call.message, call.from_user.id, module_key, 0)
     await call.answer()
 
 
@@ -710,11 +710,11 @@ async def cb_module(call: types.CallbackQuery):
 async def cb_lesson(call: types.CallbackQuery):
     _, module_key, idx = call.data.split(":")
     index = int(idx)
-    await send_lesson(call.message, call.from_user.id, module_key, index, edit=False)
+    await send_lesson(call.message, call.from_user.id, module_key, index)
     await call.answer()
 
 
-async def send_lesson(message: types.Message, user_id: int, module_key: str, index: int, edit: bool = False):
+async def send_lesson(message: types.Message, user_id: int, module_key: str, index: int):
     if module_key not in COURSE:
         return
     title, lessons = COURSE[module_key]
@@ -730,17 +730,12 @@ async def send_lesson(message: types.Message, user_id: int, module_key: str, ind
     await message.answer(text, reply_markup=kb)
 
 
-    if edit:
-        await message.edit_text(text, reply_markup=kb)
-    else:
-        await message.answer(text, reply_markup=kb)
-
 
 @dp.callback_query_handler(lambda c: c.data == "back_main")
 async def cb_back_main(call: types.CallbackQuery):
     user = get_user_by_tg(call.from_user.id)
     has_package = bool(user[7]) if user else False
-    await call.message.edit_text("Главное меню обновлено 👇", reply_markup=back_main_inline())
+    await call.message.answer("Главное меню обновлено 👇", reply_markup=back_main_inline())
     await call.message.answer("Выбери нужный раздел:", reply_markup=main_menu(has_package))
     await call.answer()
 
