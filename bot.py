@@ -17,7 +17,7 @@ from aiogram.contrib.middlewares.logging import LoggingMiddleware
 # НАСТРОЙКИ
 # ---------------------------------------------------------------------------
 
-BOT_TOKEN = "8330326273:AAEw5wkqi7rypz1LZL4LXRr2j5MpKjGc36k"
+BOT_TOKEN = "8330326273:AAEuWSwkqi7ypz1LZL4LXRr2jSMpKjGc36k"
 ADMIN_ID = 682938643
 SUPPORT_CONTACT = "@support"  # или твой логин поддержки
 
