@@ -1,1 +1,1 @@
-worker: python bot.py
+python test_bot.py
