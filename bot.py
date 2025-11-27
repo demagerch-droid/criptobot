@@ -1013,11 +1013,11 @@ async def process_successful_payment(purchase_id: int, tx_id: str, auto: bool = 
 
 def main_menu():
     kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row(KeyboardButton("🎓 Обучение трейдингу"))
     kb.row(
-        KeyboardButton("📈 Сигналы по торговле"),
-        KeyboardButton("🚀 Обучение по переливу трафика"),
+        KeyboardButton("🎓 Обучение трейдингу"),
+        KeyboardButton("📣 Обучение переливу трафика"),
     )
+    kb.row(KeyboardButton("📈 Сигналы по торговле"))
     kb.row(
         KeyboardButton("👥 Партнёрская программа"),
         KeyboardButton("📊 Моя статистика"),
@@ -1025,6 +1025,7 @@ def main_menu():
     kb.row(KeyboardButton("💰 Помогу тебе заработать"))
     kb.row(KeyboardButton("📩 Поддержка"))
     return kb
+
 
 
 
@@ -1177,27 +1178,20 @@ async def training_crypto_menu(message: types.Message):
     )
 
 
-@dp.message_handler(lambda m: m.text == "🚀 Обучение по переливу трафика")
-async def training_traffic_menu(message: types.Message):
+@dp.message_handler(lambda m: m.text == "📣 Обучение переливу трафика")
+async def traffic_training_menu(message: types.Message):
     if is_spam(message.from_user.id):
         return
 
-    user_row = get_user_by_tg(message.from_user.id)
-    if not user_row:
-        user_db_id = get_or_create_user(message)
-    else:
-        user_db_id = user_row[0]
-
-    if not has_paid_package(user_db_id):
-        await send_package_payment_instructions(message, user_db_id)
-        return
-
     await message.answer(
-        "🚀 <b>Обучение по переливу трафика</b>\n\n"
-        "Показывает, как вести TikTok и приводить людей в бота.\n\n"
-        "Выбери действие:",
-        reply_markup=training_menu_keyboard("traffic"),
+        "📣 <b>Обучение по переливу трафика</b>\n\n"
+        "Здесь собран отдельный курс, как снимать контент, "
+        "приводить людей из TikTok в бота и зарабатывать на партнёрке.\n\n"
+        "Нажми кнопку ниже, чтобы перейти к урокам 👇",
+        # здесь используем свою клавиатуру для курса по трафику
+        reply_markup=traffic_training_menu_keyboard(),  
     )
+
 
 
 async def ensure_paid_package_for_callback(call: CallbackQuery) -> bool:
