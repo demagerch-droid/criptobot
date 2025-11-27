@@ -1026,6 +1026,19 @@ def main_menu():
     kb.row(KeyboardButton("📩 Поддержка"))
     return kb
 
+def training_menu_keyboard(course: str = "crypto"):
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton(
+        "▶️ Начать / продолжить обучение",
+        callback_data=f"train_start:{course}",
+    ))
+    kb.add(InlineKeyboardButton(
+        "📚 Структура курса",
+        callback_data=f"train_structure:{course}",
+    ))
+    kb.add(InlineKeyboardButton("⬅️ В главное меню", callback_data="back_main"))
+    return kb
+
 
 # ================= ОБУЧЕНИЕ ТРЕЙДИНГУ =================
 
@@ -1220,6 +1233,17 @@ async def ensure_paid_package_for_callback(call: CallbackQuery) -> bool:
         await call.answer("Обучение доступно только после оплаты пакета за 100$.", show_alert=True)
         return False
     return True
+
+def user_has_full_access(tg_user_id: int) -> bool:
+    """
+    Полный доступ = есть оплаченный пакет (product_code = 'package', status = 'paid').
+    """
+    user = get_user_by_tg(tg_user_id)
+    if not user:
+        return False
+    user_db_id = user[0]
+    return has_paid_package(user_db_id)
+
 
 
 @dp.callback_query_handler(lambda c: c.data.startswith("back_training:"))
