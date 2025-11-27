@@ -21,11 +21,13 @@ async def cmd_start(message: types.Message):
 @dp.callback_query_handler(lambda c: True)
 async def cb_any(call: types.CallbackQuery):
     logger.info(f"CALLBACK DATA = {call.data}")
-    # показываем алерт
     await call.answer("Кнопка работает ✅", show_alert=True)
-    # и отправляем отдельное сообщение
     await call.message.answer(f"Пришёл callback: <code>{call.data}</code>")
 
 
 if __name__ == "__main__":
-    executor.start_polling(dp, skip_updates=True)
+    executor.start_polling(
+        dp,
+        skip_updates=True,
+        allowed_updates=["message", "callback_query"],
+    )
