@@ -23,7 +23,7 @@ from aiogram.contrib.middlewares.logging import LoggingMiddleware
 BOT_TOKEN = "8330326273:AAEuWSwkqi7ypz1LZL4LXRr2jSMpKjGc36k"
 ADMIN_ID = 682938643
 TRONGRID_API_KEY = "b33b8d65-10c9-47fb-99e0-ab47f3bbbb60"
-WALLET_ADDRESS = "TSY9xF24bQ3Kbdi1Npj2w4pEEoqJow1nfpr"
+WALLET_ADDRESS = "TSY9xf24bQ3Kbd1Njp2w4pEEoqJow1nfpr"
 CHANNEL_ID = -1003464806734  # канал с сигналами
 SUPPORT_CONTACT = "@support"  # логин поддержки
 
