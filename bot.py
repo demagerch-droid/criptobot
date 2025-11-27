@@ -729,14 +729,6 @@ async def send_lesson(message: types.Message, user_id: int, module_key: str, ind
 
     await message.answer(text, reply_markup=kb)
 
-@dp.callback_query_handler(lambda c: True)
-async def debug_all_callbacks(call: types.CallbackQuery):
-    logging.info(f"DEBUG CALLBACK: {call.data}")
-    try:
-        await call.message.answer(f"DEBUG: {call.data}")
-    except Exception as e:
-        logging.exception("debug callback error: %s", e)
-    await call.answer()
 
 
 
@@ -756,22 +748,6 @@ async def cb_back_main(call: types.CallbackQuery):
 
 
 # --------------------- СИГНАЛЫ И ПРОДЛЕНИЕ ---------------------
-# ===== ТЕСТ КНОПКИ ДЛЯ ДИАГНОСТИКИ =====
-
-@dp.message_handler(commands=["testbtn"])
-async def cmd_testbtn(message: types.Message):
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("Тестовая кнопка ✅", callback_data="test_button"))
-    await message.answer("Жми на тестовую кнопку ниже:", reply_markup=kb)
-
-
-@dp.callback_query_handler(lambda c: c.data == "test_button")
-async def cb_test_button(call: types.CallbackQuery):
-    await call.answer("Кнопка работает ✅", show_alert=True)
-
-
-
-
 
 @dp.message_handler(lambda m: m.text == "📈 Сигналы по торговле")
 async def signals_handler(message: types.Message):
@@ -1306,4 +1282,10 @@ async def on_startup(dp: Dispatcher):
 
 if __name__ == "__main__":
     init_db()
-    executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
+    executor.start_polling(
+        dp,
+        skip_updates=True,
+        on_startup=on_startup,
+        allowed_updates=["message", "callback_query"],
+    )
+
