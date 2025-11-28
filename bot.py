@@ -782,12 +782,6 @@ def main_reply_kb():
     return kb
 
 
-def start_inline_kb():
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("ℹ️ Как это работает", callback_data="home_how"))
-    return kb
-
-
 def edu_main_kb():
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton("📈 Курс по трейдингу", callback_data="edu_crypto"))
