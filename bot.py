@@ -784,9 +784,6 @@ def main_reply_kb():
 
 def start_inline_kb():
     kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("🧠 Обучение", callback_data="home_edu"))
-    kb.add(InlineKeyboardButton("💸 Заработок и партнёрка", callback_data="home_earn"))
-    kb.add(InlineKeyboardButton("👤 Профиль", callback_data="home_profile"))
     kb.add(InlineKeyboardButton("ℹ️ Как это работает", callback_data="home_how"))
     return kb
 
