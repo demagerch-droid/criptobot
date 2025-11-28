@@ -895,7 +895,7 @@ async def cmd_start(message: types.Message):
     )
 
     await message.answer(text, reply_markup=main_reply_kb())
-    await message.answer("Меню действий 👇", reply_markup=start_inline_kb())
+    await message.answer("Общая информация 👇", reply_markup=start_inline_kb())
 
 
 # ---------------------------------------------------------------------------
