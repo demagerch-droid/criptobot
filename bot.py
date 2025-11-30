@@ -785,7 +785,6 @@ def main_reply_kb():
 def start_inline_kb():
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton("ℹ️ Как это работает", callback_data="home_how"))
-    kb.add(InlineKeyboardButton("⬅️ В начало", callback_data="back_home"))
     return kb
 
 
@@ -959,6 +958,7 @@ async def cb_home_how(call: CallbackQuery):
 "Все решения по сделкам ты принимаешь сам.\n\n"
 
     )
+    kb.add(InlineKeyboardButton("⬅️ В начало", callback_data="back_home"))
     try:
         await call.message.edit_text(text, reply_markup=start_inline_kb())
     except Exception:
