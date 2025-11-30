@@ -1008,7 +1008,7 @@ async def cb_edu_structure(call: CallbackQuery):
     lines.append("\nНажми кнопку ниже, чтобы перейти к курсу.")
     text_crypto = "\n".join(lines)
 
-    # Структура трафика
+    # Структура трафика 
     lines2 = ["📚 <b>Структура курса по трафику (6 модулей)</b>\n"]
     for title, _ in COURSE_TRAFFIC:
         lines2.append(f"• {title}")
