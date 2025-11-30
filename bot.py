@@ -38,7 +38,7 @@ USDT_CONTRACT = "TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj"
 
 # ID канала с сигналами (число, например -1001234567890)
 # TODO: вставь сюда ID своего канала с сигналами
-SIGNALS_CHANNEL_ID = "https://t.me/fjsidjdjjs"
+SIGNALS_CHANNEL_URL = "https://t.me/fjsidjdjjs"
 
 # Ссылка на сигнальный канал (на случай, если удобнее давать ссылку)
 SIGNALS_CHANNEL_LINK = "https://t.me/your_signals_channel"
@@ -807,7 +807,7 @@ def earn_main_kb():
     kb.add(InlineKeyboardButton("📎 Подробнее про партнёрку", callback_data="earn_more"))
     kb.add(InlineKeyboardButton("📊 Моя статистика", callback_data="earn_stats"))
     kb.add(InlineKeyboardButton("🏆 Топ партнёров", callback_data="earn_top"))
-    kb.add(InlineKeyboardButton("📡 Канал с сигналами", url=SIGNALS_CHANNEL_ID))
+    kb.add(InlineKeyboardButton("📡 Канал с сигналами", url=SIGNALS_CHANNEL_URL))
     kb.add(InlineKeyboardButton("💳 Открыть полный доступ ($100)", callback_data="open_access"))
     kb.add(InlineKeyboardButton("⬅️ В начало", callback_data="back_home"))
     return kb
