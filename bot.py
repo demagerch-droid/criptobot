@@ -807,7 +807,7 @@ def earn_main_kb():
     kb.add(InlineKeyboardButton("📎 Подробнее про партнёрку", callback_data="earn_more"))
     kb.add(InlineKeyboardButton("📊 Моя статистика", callback_data="earn_stats"))
     kb.add(InlineKeyboardButton("🏆 Топ партнёров", callback_data="earn_top"))
-    kb.add(InlineKeyboardButton("📡 Канал с сигналами", url=SIGNALS_CHANNEL_URL))
+    kb.add(InlineKeyboardButton("📡 Канал с сигналами", callback_data="signals_channel"))
     kb.add(InlineKeyboardButton("💳 Открыть полный доступ ($100)", callback_data="open_access"))
     kb.add(InlineKeyboardButton("⬅️ В начало", callback_data="back_home"))
     return kb
@@ -1316,6 +1316,71 @@ async def cb_my_ref(call: CallbackQuery):
     except Exception:
         await call.message.answer(text)
     await call.answer()
+ 
+ @dp.callback_query_handler(lambda c: c.data == "signals_channel")
+ async def cb_signals_channel(call: CallbackQuery):
+     user_row = get_user_by_tg(call.from_user.id)
+     if not user_row:        await call.answer("Сначала запусти бота через /start.", show_alert=True)
+         return
+ 
+     user_db_id = user_row[0]
+     full_access = bool(user_row[7])
+     signals_until = get_signals_until(user_db_id)
+ 
+     # 1) Полного доступа ещё нет → предлагаем купить пакет за $100
+     if not full_access:
+         text = (
+             "📡 <b>Канал с сигналами</b>\n\n"
+             "Доступ к сигналам открывается после покупки полного доступа за <b>$100</b>.\n\n"
+             "Ты получаешь:\n"
+             "• обучение по трейдингу (8 модулей)\n"
+             "• обучение по трафику (6 модулей)\n"
+             "• 1 месяц доступа к сигналам\n"
+             "• партнёрскую программу 50% + 10%\n\n"
+             "Чтобы попасть в канал — оформи полный доступ."
+         )
+         kb = InlineKeyboardMarkup()
+         kb.add(InlineKeyboardButton("💳 Открыть полный доступ ($100)", callback_data="open_access"))
+         kb.add(InlineKeyboardButton("⬅️ Назад к разделу «Заработок»", callback_data="home_earn"))
+         try:
+             await call.message.edit_text(text, reply_markup=kb)
+         except Exception:
+             await call.message.answer(text, reply_markup=kb)
+         await call.answer()
+         return
+ 
+     # 2) Полный доступ есть, но подписка на сигналы не активна → просим оплатить продление
+     now = datetime.utcnow()
+     if not signals_until or signals_until < now:
+         text = (
+             "📡 <b>Канал с сигналами</b>\n\n"
+             "Сейчас твоя подписка на сигналы <b>не активна</b>.\n\n"
+             "Чтобы снова получать сигналы, оплати продление за <b>$50</b> на 1 месяц."
+         )
+         kb = InlineKeyboardMarkup()
+         kb.add(InlineKeyboardButton("💳 Оплатить продление сигналов ($50)", callback_data="renew_signals"))
+         kb.add(InlineKeyboardButton("⬅️ Назад к разделу «Заработок»", callback_data="home_earn"))
+         try:
+             await call.message.edit_text(text, reply_markup=kb)
+         except Exception:
+             await call.message.answer(text, reply_markup=kb)
+         await call.answer()
+         return
+ 
+     # 3) Всё оплачено и подписка активна → даём ссылку на канал
+     text = (
+         "📡 <b>Канал с сигналами</b>\n\n"
+         f"Твоя подписка активна до: <b>{signals_until.strftime('%Y-%m-%d')}</b>.\n\n"
+         "Нажми кнопку ниже, чтобы перейти в закрытый канал."
+     )
+     kb = InlineKeyboardMarkup()
+     kb.add(InlineKeyboardButton("📡 Открыть канал с сигналами", url=SIGNALS_CHANNEL_LINK))
+     kb.add(InlineKeyboardButton("⬅️ Назад к разделу «Заработок»", callback_data="home_earn"))
+     try:
+         await call.message.edit_text(text, reply_markup=kb)
+     except Exception:
+         await call.message.answer(text, reply_markup=kb)
+     await call.answer()
 
 
 # ---------------------------------------------------------------------------
