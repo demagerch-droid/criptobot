@@ -41,7 +41,7 @@ USDT_CONTRACT = "TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj"
 SIGNALS_CHANNEL_URL = "https://t.me/fjsidjdjjs"
 
 # Ссылка на сигнальный канал (на случай, если удобнее давать ссылку)
-SIGNALS_CHANNEL_LINK = "https://t.me/your_signals_channel"
+SIGNALS_CHANNEL_ID = -1003464806734
 
 # Ссылки на обучающие каналы
 TRADING_EDU_CHANNEL = "https://t.me/your_trading_edu_channel"
