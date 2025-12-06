@@ -1658,7 +1658,35 @@ async def cmd_test_signal(message: types.Message):
         await message.answer("✅ Тестовый авто-сигнал отправлен в канал.")
     except Exception as e:
         await message.answer(f"❌ Ошибка при отправке в канал.\nПроверь права бота и ID канала.")
+        
+@dp.message_handler(commands=["check_binance"])
+async def cmd_check_binance(message: types.Message):
+    # Только админ
+    if not is_admin(message.from_user.id):
+        return
 
+    await message.answer("⏳ Проверяю Binance...")
+
+    url = "https://api.binance.com/api/v3/ticker/24hr"
+    params = {"symbol": "BTCUSDT"}
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params, timeout=10) as resp:
+                status = resp.status
+                text = await resp.text()
+    except Exception as e:
+        await message.answer(f"❌ Ошибка при запросе к Binance:\n<code>{e}</code>")
+        return
+
+    # Показываем статус и первые символы ответа
+    short = text[:600]
+    await message.answer(
+        f"Статус Binance: <b>{status}</b>\n\n"
+        f"Первые символы ответа:\n<code>{short}</code>"
+    )
+
+    
 
 
 def _find_user_by_any(identifier: str):
