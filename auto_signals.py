@@ -4,26 +4,20 @@ import asyncio
 import random
 import logging
 from decimal import Decimal
-from typing import Optional, Sequence
+from typing import Optional, Sequence, List, Tuple
 from datetime import datetime
 
 import aiohttp
 from aiogram import Bot
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 logger = logging.getLogger(__name__)
 
 # --- ТИХИЕ ЧАСЫ (по твоему локальному времени) ---
 
-QUIET_HOURS_ENABLED = True      # если False — сигналы круглосуточно
-QUIET_HOURS_START = 0           # c 00:00
-QUIET_HOURS_END = 8             # до 08:00 сигналы не шлём
-QUIET_HOURS_UTC_OFFSET = 2      # смещение от UTC (Киев зимой +2, летом можно поставить 3)
-
-# --- МОДЕРАЦИЯ АВТО-СИГНАЛОВ ---
-
-MODERATION_ENABLED = False       # True = сначала тебе на approve, потом в канал
-ADMIN_ID_FOR_SIGNALS = 682938643  # Поставь тот же ID, что ADMIN_ID в bot.py
+QUIET_HOURS_ENABLED = True   # если хочешь сигналы 24/7 — поставь False
+QUIET_HOURS_START = 0        # c 00:00
+QUIET_HOURS_END = 7          # до 07:00 сигналы не шлём
+QUIET_HOURS_UTC_OFFSET = 2   # сдвиг от UTC (Киев зимой +2, летом можешь поставить 3)
 
 # --- CoinGecko ---
 
@@ -35,39 +29,70 @@ COINGECKO_IDS = {
     "ETHUSDT": "ethereum",
     "SOLUSDT": "solana",
     "BNBUSDT": "binancecoin",
-    # если добавишь пары в AUTO_SIGNALS_SYMBOLS — допиши сюда ID
+    # если добавишь пары в AUTO_SIGNALS_SYMBOLS — не забудь дописать сюда
 }
 
+# Параметры «стратегии»
+FAST_EMA_PERIOD = 20      # быстрая EMA по закрытиям
+SLOW_EMA_PERIOD = 50      # медленная EMA (фильтр тренда)
+ATR_PERIOD = 14           # сколько последних интервалов для волатильности
 
-async def fetch_coingecko_price(coin_id: str) -> Optional[dict]:
+# Фильтры по тренду и волатильности
+MIN_TREND_PCT = Decimal("0.3")  # минимальная сила тренда относительно EMA50 (в %)
+MIN_ATR_PCT = Decimal("0.2")    # слишком низкая вола (менее 0.2% за свечу) — не торгуем
+MAX_ATR_PCT = Decimal("6")      # слишком бешеная вола (более 6% за свечу) — тоже не лезем
+
+
+# ---------- ЗАГРУЗКА СВЕЧ ИЗ COINGECKO (через market_chart) ----------
+
+async def fetch_coingecko_market_chart(coin_id: str, days: int = 3) -> Optional[List[Tuple[int, Decimal]]]:
     """
-    Берём цену и 24h изменение по монете с CoinGecko.
-    /simple/price с vs_currencies=usd и include_24hr_change=true.
+    Берём исторический график с CoinGecko:
+    /coins/{id}/market_chart?vs_currency=usd&days=3
+
+    Для 1–90 дней CoinGecko на бесплатном плане даёт данные с часовым шагом —
+    нам этого достаточно, чтобы посчитать EMA и волатильность по закрытиям.
     """
-    url = f"{COINGECKO_API_BASE}/simple/price"
+    url = f"{COINGECKO_API_BASE}/coins/{coin_id}/market_chart"
     params = {
-        "ids": coin_id,
-        "vs_currencies": "usd",
-        "include_24hr_change": "true",
+        "vs_currency": "usd",
+        "days": days,
     }
 
     async with aiohttp.ClientSession() as session:
         try:
             async with session.get(url, params=params, timeout=10) as resp:
                 if resp.status != 200:
-                    logger.warning("CoinGecko price %s status %s", coin_id, resp.status)
+                    logger.warning("CoinGecko market_chart %s status %s", coin_id, resp.status)
                     return None
                 data = await resp.json()
-                return data
         except Exception as e:
-            logger.error("Error fetching CoinGecko price for %s: %s", coin_id, e)
+            logger.error("Error fetching CoinGecko market_chart for %s: %s", coin_id, e)
             return None
 
+    prices = data.get("prices")
+    if not prices or len(prices) < 10:
+        return None
+
+    series: List[Tuple[int, Decimal]] = []
+    for ts, price in prices:
+        try:
+            ts_int = int(ts)
+            p_dec = Decimal(str(price))
+        except Exception:
+            continue
+        series.append((ts_int, p_dec))
+
+    if len(series) < 10:
+        return None
+
+    return series
+
+
+# ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ----------
 
 def _format_price(p: Decimal) -> str:
-    """
-    Примитивное форматирование: чем больше цена, тем меньше знаков после запятой.
-    """
+    """Формат цены с разумным количеством знаков."""
     if p >= Decimal("100"):
         q = p.quantize(Decimal("0.1"))
     elif p >= Decimal("1"):
@@ -79,17 +104,56 @@ def _format_price(p: Decimal) -> str:
     return str(q)
 
 
+def _format_pct(x: Decimal) -> str:
+    """Формат процента с 2 знаками."""
+    q = x.quantize(Decimal("0.01"))
+    return str(q)
+
+
+def _ema(values: Sequence[Decimal], period: int) -> Optional[Decimal]:
+    """Классическая EMA по списку значений."""
+    if len(values) < period:
+        return None
+    alpha = Decimal("2") / Decimal(period + 1)
+    ema_val = values[0]
+    for v in values[1:]:
+        ema_val = (v - ema_val) * alpha + ema_val
+    return ema_val
+
+
+def _atr_like(values: Sequence[Decimal], period: int) -> Optional[Decimal]:
+    """
+    Простейший ATR-подобный показатель:
+    среднее абсолютное изменение между соседними закрытиями за N последних интервалов.
+    Не классический ATR, но даёт адекватную оценку волатильности.
+    """
+    if len(values) <= period:
+        return None
+    diffs = []
+    for i in range(-period, 0):
+        try:
+            prev_v = values[i - 1]
+            cur_v = values[i]
+        except IndexError:
+            continue
+        diffs.append(abs(cur_v - prev_v))
+    if not diffs:
+        return None
+    return sum(diffs, Decimal("0")) / Decimal(len(diffs))
+
+
+# ---------- ПОСТРОЕНИЕ СИГНАЛА ПО СВЕЧАМ + EMA + ВОЛАТИЛЬНОСТИ ----------
+
 async def build_auto_signal_text(
     symbols: Sequence[str],
     enabled: bool,
 ) -> Optional[str]:
     """
-    Улучшенная версия авто-сигнала:
-    • берём пару из списка symbols
-    • тянем цену и 24h изменение с CoinGecko
-    • фильтруем слишком слабое и слишком дикое движение
-    • для BTC/ETH даём более мягкие SL/TP, для альтов — агрессивнее
-    • вход показываем диапазоном
+    Генерация авто-сигнала на основе:
+    • исторических данных с CoinGecko (серия закрытий)
+    • EMA20 / EMA50 (тренд)
+    • ATR-подобной волатильности за 14 интервалов
+    • фильтров по тренду и волатильности
     """
     if not enabled:
         return None
@@ -102,108 +166,105 @@ async def build_auto_signal_text(
         logger.warning("No CoinGecko ID for pair %s", pair)
         return None
 
-    data = await fetch_coingecko_price(coin_id)
-    if not data or coin_id not in data:
+    # Берём ~3 дня истории, там будут почасовые точки
+    series = await fetch_coingecko_market_chart(coin_id, days=3)
+    if not series:
         return None
 
-    coin_data = data[coin_id]
-    price_usd = coin_data.get("usd")
-    change_percent = coin_data.get("usd_24h_change")
-
-    try:
-        price = Decimal(str(price_usd))
-    except Exception:
+    closes = [p for _, p in series]
+    if len(closes) < max(SLOW_EMA_PERIOD, ATR_PERIOD) + 5:
+        # мало данных, лучше ничего не давать, чем городить мусор
         return None
 
-    try:
-        chg = Decimal(str(change_percent)) if change_percent is not None else None
-    except Exception:
-        chg = None
+    last_close = closes[-1]
 
-    # Если не смогли посчитать изменение — выходим
-    if chg is None:
+    ema_fast = _ema(closes, FAST_EMA_PERIOD)
+    ema_slow = _ema(closes, SLOW_EMA_PERIOD)
+    if ema_fast is None or ema_slow is None:
         return None
 
-    # Фильтр по движению: слишком слабое и слишком дикое движение пропускаем
-    abs_chg = chg.copy_abs()
-    if abs_chg < Decimal("1.5"):
-        # меньше 1.5% за сутки — флет, сигнал не даём
-        return None
-    if abs_chg > Decimal("18"):
-        # больше 18% — слишком агрессивный памп/дамп, тоже пропускаем
+    atr = _atr_like(closes, ATR_PERIOD)
+    if atr is None or atr <= 0:
         return None
 
-    # Определяем направление
-    if chg > Decimal("1"):
+    # Сила тренда относительно медленной EMA
+    trend_pct = (last_close - ema_slow) / last_close * Decimal("100")
+    # Средняя волатильность в процентах
+    atr_pct = atr / last_close * Decimal("100")
+
+    # Фильтр по волатильности
+    if atr_pct < MIN_ATR_PCT or atr_pct > MAX_ATR_PCT:
+        # либо слишком скучно, либо слишком бешено — пропускаем
+        return None
+
+    direction = None
+    idea_lines = []
+
+    # Фильтр по тренду: цена + EMA20 + EMA50 должны смотреть в одну сторону
+    if trend_pct > MIN_TREND_PCT and ema_fast > ema_slow:
         direction = "long"
-        idea = "🟢 Идея: LONG (преобладает восходящее движение за 24ч)"
-    elif chg < Decimal("-1"):
+        idea_lines.append("🟢 Идея: LONG по тренду (цена выше EMA, бычий наклон).")
+    elif trend_pct < -MIN_TREND_PCT and ema_fast < ema_slow:
         direction = "short"
-        idea = "🔴 Идея: SHORT (преобладает нисходящее движение за 24ч)"
+        idea_lines.append("🔴 Идея: SHORT по тренду (цена ниже EMA, медвежий наклон).")
     else:
-        direction = None
-        idea = "⚪ Рынок во флете, явного тренда за 24ч нет. Сигнал без конкретных уровней."
+        # тренд слабый/размазанный — не даём сигнал
+        return None
 
-    # Если по какой-то причине направления нет — просто обзор без уровней
-    if direction is None:
-        parts = [
-            f"📡 <b>Авто-сигнал</b> по <b>{pair}</b>",
-            f"Текущая цена: <b>{_format_price(price)}</b> USDT",
-            f"Изменение за 24ч: <b>{chg}%</b>",
-            "",
-            idea,
-            "",
-            "⚠️ Это автоматический технический сигнал от бота, не финансовая рекомендация.",
-        ]
-        return "\n".join(parts)
-
-    # Разные проценты для BTC/ETH и альтов
+    # Разные настройки для BTC/ETH и альтов
     if pair in ("BTCUSDT", "ETHUSDT"):
-        sl_pct = Decimal("0.005")   # 0.5%
-        tp1_pct = Decimal("0.01")   # 1%
-        tp2_pct = Decimal("0.02")   # 2%
+        sl_mult = Decimal("1.5")   # стоп ~1.5 ATR
+        tp1_mult = Decimal("1.5")  # TP1 ~1.5 ATR
+        tp2_mult = Decimal("3")    # TP2 ~3 ATR
     else:
-        sl_pct = Decimal("0.01")    # 1%
-        tp1_pct = Decimal("0.02")   # 2%
-        tp2_pct = Decimal("0.04")   # 4%
+        sl_mult = Decimal("1.8")   # альты агрессивнее
+        tp1_mult = Decimal("2")
+        tp2_mult = Decimal("4")
 
-    entry_mid = price
+    entry_mid = last_close
+    entry_zone = atr * Decimal("0.5")  # вход диапазоном ≈ пол-ATR
 
-    # Вход диапазоном
     if direction == "long":
-        entry_low = entry_mid * (Decimal("1") - Decimal("0.002"))   # -0.2%
+        entry_low = entry_mid - entry_zone
         entry_high = entry_mid
-        sl = entry_mid * (Decimal("1") - sl_pct)
-        tp1 = entry_mid * (Decimal("1") + tp1_pct)
-        tp2 = entry_mid * (Decimal("1") + tp2_pct)
+        sl = entry_mid - sl_mult * atr
+        tp1 = entry_mid + tp1_mult * atr
+        tp2 = entry_mid + tp2_mult * atr
         dir_text = "LONG"
-    else:  # short
+    else:
         entry_low = entry_mid
-        entry_high = entry_mid * (Decimal("1") + Decimal("0.002"))  # +0.2%
-        sl = entry_mid * (Decimal("1") + sl_pct)
-        tp1 = entry_mid * (Decimal("1") - tp1_pct)
-        tp2 = entry_mid * (Decimal("1") - tp2_pct)
+        entry_high = entry_mid + entry_zone
+        sl = entry_mid + sl_mult * atr
+        tp1 = entry_mid - tp1_mult * atr
+        tp2 = entry_mid - tp2_mult * atr
         dir_text = "SHORT"
 
     parts = [
-        f"📡 <b>Авто-сигнал</b> по <b>{pair}</b>",
-        f"Текущая цена: <b>{_format_price(price)}</b> USDT",
-        f"Изменение за 24ч: <b>{chg}%</b>",
+        f"📡 <b>Авто-сигнал (EMA + волатильность)</b> по <b>{pair}</b>",
+        f"Текущая цена (закрытие последнего интервала): <b>{_format_price(last_close)}</b> USDT",
+        f"Сила тренда относительно EMA{SLOW_EMA_PERIOD}: <b>{_format_pct(trend_pct)}%</b>",
+        f"Средняя волатильность за {ATR_PERIOD} интервалов: <b>{_format_pct(atr_pct)}%</b> за свечу",
         "",
-        idea,
-        "",
-        f"📊 <b>Параметры сделки ({dir_text})</b>",
-        f"Вход: <b>{_format_price(entry_low)}</b>–<b>{_format_price(entry_high)}</b> USDT",
-        f"Стоп-лосс: <b>{_format_price(sl)}</b> USDT",
-        f"Тейк-профит 1: <b>{_format_price(tp1)}</b> USDT",
-        f"Тейк-профит 2: <b>{_format_price(tp2)}</b> USDT",
-        "",
-        "⚠️ Это автоматический технический сигнал от бота, не финансовая рекомендация.",
-        "Риск-менеджмент: не рискуй более 1–2% депозита на сделку и всегда используй стоп-лосс.",
     ]
+    parts.extend(idea_lines)
+    parts.extend(
+        [
+            "",
+            f"📊 <b>Параметры сделки ({dir_text})</b>",
+            f"Вход: <b>{_format_price(entry_low)}</b>–<b>{_format_price(entry_high)}</b> USDT",
+            f"Стоп-лосс: <b>{_format_price(sl)}</b> USDT",
+            f"Тейк-профит 1: <b>{_format_price(tp1)}</b> USDT",
+            f"Тейк-профит 2: <b>{_format_price(tp2)}</b> USDT",
+            "",
+            "⚠️ Это автоматический технический сигнал по свечам и EMA, не финансовая рекомендация.",
+            "Риск-менеджмент: не рискуй более 1–2% депозита на сделку и всегда используй стоп-лосс.",
+        ]
+    )
 
     return "\n".join(parts)
 
+
+# ---------- ВОРКЕР, КОТОРЫЙ РАЗ В N ЧАСОВ ДАЁТ СИГНАЛЫ ----------
 
 async def auto_signals_worker(
     bot: Bot,
@@ -213,9 +274,10 @@ async def auto_signals_worker(
     enabled: bool,
 ) -> None:
     """
-    Фоновая задача: раз в N секунд генерит авто-сигнал.
-    • Учитывает тихие часы
-    • При включённой модерации шлёт сигнал админу на approve/skip
+    Фоновая задача:
+    • раз в N часов пробует сгенерировать сигнал
+    • учитывает тихие часы
+    • если фильтры не проходят — просто ничего не шлёт
     """
     if not enabled:
         logger.info("Auto signals disabled, worker not started.")
@@ -227,18 +289,18 @@ async def auto_signals_worker(
 
     interval = int(24 * 3600 / max(auto_signals_per_day, 1))
 
-    # немного ждём старт бота
+    # Немного ждём старт бота
     await asyncio.sleep(15)
 
     while True:
         try:
-            # Проверяем тихие часы
             now_utc = datetime.utcnow()
             local_hour = (now_utc.hour + QUIET_HOURS_UTC_OFFSET) % 24
 
             in_quiet = False
             if QUIET_HOURS_ENABLED:
                 if QUIET_HOURS_START <= QUIET_HOURS_END:
+                    # обычный диапазон, напр. 0–7
                     in_quiet = QUIET_HOURS_START <= local_hour < QUIET_HOURS_END
                 else:
                     # диапазон через полночь, напр. 23–7
@@ -249,29 +311,8 @@ async def auto_signals_worker(
             else:
                 text = await build_auto_signal_text(symbols, enabled)
                 if text:
-                    if MODERATION_ENABLED:
-                        # сначала шлём админу на модерацию
-                        kb = InlineKeyboardMarkup()
-                        kb.add(
-                            InlineKeyboardButton(
-                                "✅ Отправить в канал", callback_data="auto_sig_approve"
-                            )
-                        )
-                        kb.add(
-                            InlineKeyboardButton(
-                                "❌ Пропустить", callback_data="auto_sig_skip"
-                            )
-                        )
-                        await bot.send_message(
-                            ADMIN_ID_FOR_SIGNALS,
-                            text + "\n\n<b>Отправить этот сигнал в канал?</b>",
-                            reply_markup=kb,
-                        )
-                        logger.info("Auto signal sent to admin %s for moderation", ADMIN_ID_FOR_SIGNALS)
-                    else:
-                        # сразу в канал
-                        await bot.send_message(signals_channel_id, text)
-                        logger.info("Auto signal sent to %s", signals_channel_id)
+                    await bot.send_message(signals_channel_id, text)
+                    logger.info("Auto signal sent to %s", signals_channel_id)
         except Exception as e:
             logger.error("Auto signals worker error: %s", e)
 
