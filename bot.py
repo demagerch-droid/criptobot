@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 
 import aiohttp
 from aiogram import Bot, Dispatcher, executor, types
-from auto_signals import auto_signals_worker
+from auto_signals import auto_signals_worker, build_auto_signal_text
 from aiogram.types import (
     ReplyKeyboardMarkup,
     KeyboardButton,
@@ -1635,6 +1635,30 @@ async def cmd_admin(message: types.Message):
         "/user &lt;id или @username&gt; — инфо по пользователю"
     )
     await message.answer(text)
+    
+@dp.message_handler(commands=["test_signal"])
+async def cmd_test_signal(message: types.Message):
+    # Только админ
+    if not is_admin(message.from_user.id):
+        return
+
+    await message.answer("⏳ Генерирую тестовый авто-сигнал...")
+
+    text = await build_auto_signal_text(
+        AUTO_SIGNALS_SYMBOLS,
+        True,  # включено принудительно
+    )
+
+    if not text:
+        await message.answer("❌ Не удалось сгенерировать авто-сигнал (нет данных от Binance или ошибка).")
+        return
+
+    try:
+        await bot.send_message(SIGNALS_CHANNEL_ID, text)
+        await message.answer("✅ Тестовый авто-сигнал отправлен в канал.")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка при отправке в канал.\nПроверь права бота и ID канала.")
+
 
 
 def _find_user_by_any(identifier: str):
