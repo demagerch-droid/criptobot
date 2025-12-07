@@ -22,7 +22,7 @@ from aiogram.contrib.middlewares.logging import LoggingMiddleware
 # ---------------------------------------------------------------------------
 
 # TODO: если хочешь, можешь вернуть сюда чтение из .env, но по твоей просьбе — вставляю сразу константой
-BOT_TOKEN = "8330326273:AAEuWSwkqi7ypz1LZL4LXRr2jSMpKjGc36k"
+BOT_TOKEN = "8306701860:AAFKZXLryFfy7reYYqvE0U5V-Npnr0tU2Oc"
 
 # твой админ ID (из прошлых файлов)
 ADMIN_ID = 682938643
