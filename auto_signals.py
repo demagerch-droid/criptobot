@@ -19,7 +19,7 @@ QUIET_HOURS_START = 0        # c 00:00
 QUIET_HOURS_END = 7          # до 07:00 сигналы не шлём
 QUIET_HOURS_UTC_OFFSET = 2   # сдвиг от UTC (Киев зимой +2, летом можешь поставить 3)
 
-# --- CoinGecko ---
+# --- CoinGecko --- 
 
 COINGECKO_API_BASE = "https://api.coingecko.com/api/v3"
 
