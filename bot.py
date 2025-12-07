@@ -25,7 +25,7 @@ from aiogram.contrib.middlewares.logging import LoggingMiddleware
 BOT_TOKEN = "8306701860:AAFKZXLryFfy7reYYqvE0U5V-Npnr0tU2Oc"
 
 # твой админ ID (из прошлых файлов)
-ADMIN_ID = 682938643
+ADMIN_ID = 8585550939
 
 # Tron / TronGrid
 # TODO: сюда вставь свой ключ TronGrid, который ты мне отправлял (GUID вида xxxx-xxxx-xxxx)
@@ -58,7 +58,7 @@ TRADING_EDU_CHANNEL = "https://t.me/your_trading_edu_channel"
 TRAFFIC_EDU_CHANNEL = "https://t.me/your_traffic_edu_channel"
 
 # Контакт поддержки
-SUPPORT_CONTACT = "@support"  # при желании поменяешь на свой @ник
+SUPPORT_CONTACT = "@TradeX_Partner_helper"  # при желании поменяешь на свой @ник
 
 # Цены и проценты
 PRICE_PACKAGE = Decimal("100")   # полный доступ
