@@ -42,11 +42,11 @@ USDT_CONTRACT = "TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj"
 SIGNALS_CHANNEL_URL = "https://t.me/fjsidjdjjs"
 
 # Ссылка на сигнальный канал (на случай, если удобнее давать ссылку)
-SIGNALS_CHANNEL_ID = -1003464806734
+SIGNALS_CHANNEL_ID = -1003215636168
 
 
 # Ссылка на сигнальный канал (для кнопок и сообщений)
-SIGNALS_CHANNEL_LINK = "https://t.me/fjsidjdjjs"  # 👈 сюда реальную ссылку
+SIGNALS_CHANNEL_LINK = "https://t.me/+uScs9-WDtW5hYTIy"  # 👈 сюда реальную ссылку
 
 # Авто-сигналы
 AUTO_SIGNALS_ENABLED = True          # если захочешь вырубить — поставишь False
