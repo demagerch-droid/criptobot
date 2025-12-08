@@ -32,10 +32,10 @@ ADMIN_ID = 8585550939
 TRONGRID_API_KEY = "b33b8d65-10c9-4f7b-99e0-ab47f3bbb60f"
 
 # TODO: сюда вставь свой TRON-кошелёк, на который люди отправляют USDT (TRC20)
-WALLET_ADDRESS = "TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj"
+WALLET_ADDRESS = "TMVnoYkCsU3XHV28P5vMZokcWinqE3pUcK"
 
 # Стандартный контракт USDT TRC20 (можно не менять)
-USDT_CONTRACT = "TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj"
+USDT_CONTRACT = "TMVnoYkCsU3XHV28P5vMZokcWinqE3pUcK"
 
 # ID канала с сигналами (число, например -1001234567890)
 # TODO: вставь сюда ID своего канала с сигналами
