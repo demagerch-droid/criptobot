@@ -54,8 +54,8 @@ AUTO_SIGNALS_PER_DAY = 5             # примерно сколько сигн�
 AUTO_SIGNALS_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]  # пары для сигналов
 
 # Ссылки на обучающие каналы
-TRADING_EDU_CHANNEL = "https://t.me/your_trading_edu_channel"
-TRAFFIC_EDU_CHANNEL = "https://t.me/your_traffic_edu_channel"
+TRADING_EDU_CHANNEL = "https://t.me/+RPev0hkFwjk5MmQy"
+TRAFFIC_EDU_CHANNEL = "https://t.me/+AA8Un3DxezdkNWQy"
 
 # Контакт поддержки
 SUPPORT_CONTACT = "@TradeX_Partner_helper"  # при желании поменяешь на свой @ник
