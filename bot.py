@@ -2,6 +2,7 @@ import logging
 import sqlite3
 import asyncio
 import random
+import os
 from decimal import Decimal, ROUND_DOWN
 from datetime import datetime, timedelta
 
@@ -18,7 +19,7 @@ from aiogram.types import (
 from aiogram.contrib.middlewares.logging import LoggingMiddleware
 
 # ---------------------------------------------------------------------------
-# НАСТРОЙКИ  
+# НАСТРОЙКИ    
 # ---------------------------------------------------------------------------
 
 # TODO: если хочешь, можешь вернуть сюда чтение из .env, но по твоей просьбе — вставляю сразу константой
@@ -66,7 +67,7 @@ PRICE_RENEWAL = Decimal("50")    # продление сигналов
 LEVEL1_PERCENT = Decimal("0.5")  # 50%
 LEVEL2_PERCENT = Decimal("0.1")  # 10%
 
-DB_PATH = "database.db"
+DB_PATH = os.getenv("DB_PATH", "database.db")
 
 # Антиспам (минимальный интервал между сообщениями)
 ANTISPAM_SECONDS = 1.2
