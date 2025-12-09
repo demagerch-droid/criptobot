@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 import aiohttp
 from aiogram import Bot, Dispatcher, executor, types
 from auto_signals import auto_signals_worker, build_auto_signal_text
-from database import init_db, get_or_create_user, user_has_active_signals
+from database import init_db, get_or_create_user
 from aiogram.types import (
     ReplyKeyboardMarkup,
     KeyboardButton,
@@ -154,42 +154,6 @@ def init_db():
     conn.close()
 
 
-def get_or_create_user(message: types.Message, referrer_id_db: int = None) -> int:
-    user_id = message.from_user.id
-    username = message.from_user.username or ""
-    first_name = message.from_user.first_name or ""
-
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT id FROM users WHERE user_id = ?",
-        (user_id,),
-    )
-    row = cur.fetchone()
-
-    if row:
-        user_db_id = row[0]
-        # на всякий случай обновляем логин / имя
-        cur.execute(
-            "UPDATE users SET username = ?, first_name = ? WHERE id = ?",
-            (username, first_name, user_db_id),
-        )
-        conn.commit()
-        conn.close()
-        return user_db_id
-
-    reg_date = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    cur.execute(
-        """
-        INSERT INTO users (user_id, username, first_name, referrer_id, reg_date)
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        (user_id, username, first_name, referrer_id_db, reg_date),
-    )
-    conn.commit()
-    user_db_id = cur.lastrowid
-    conn.close()
-    return user_db_id
 
 
 def get_user_by_tg(user_id: int):
@@ -873,18 +837,18 @@ def traffic_modules_kb():
 async def cmd_start(message: types.Message):
     args = message.text.split()
     referrer_tg_id = None
-
     if len(args) > 1:
         try:
             referrer_tg_id = int(args[1])
         except ValueError:
             referrer_tg_id = None
 
-    # 🔹 Передаём только 2 аргумента, как ждёт функция в database.py
+    # вызываем уже функцию ИЗ database.py
     user_row = get_or_create_user(message.from_user.id, referrer_tg_id)
 
-    # дальше твой текст и кнопки
     await message.answer("👋 Добро пожаловать! Тут будет главное меню.")
+
+
 
 
 
