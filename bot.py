@@ -873,23 +873,19 @@ def traffic_modules_kb():
 async def cmd_start(message: types.Message):
     args = message.text.split()
     referrer_tg_id = None
+
     if len(args) > 1:
         try:
             referrer_tg_id = int(args[1])
         except ValueError:
             referrer_tg_id = None
 
-    # ВАЖНО: без имён аргументов
-    user_row = get_or_create_user(
-        message.from_user.id,
-        message.from_user.username,
-        message.from_user.first_name,
-        message.from_user.last_name,
-        referrer_tg_id
-    )
+    # 🔹 Передаём только 2 аргумента, как ждёт функция в database.py
+    user_row = get_or_create_user(message.from_user.id, referrer_tg_id)
 
-    # дальше твой красивый текст / меню
+    # дальше твой текст и кнопки
     await message.answer("👋 Добро пожаловать! Тут будет главное меню.")
+
 
 
 
