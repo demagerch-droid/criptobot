@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 import aiohttp
 from aiogram import Bot, Dispatcher, executor, types
 from auto_signals import auto_signals_worker, build_auto_signal_text
+from database import init_db, get_or_create_user, user_has_active_signals
 from aiogram.types import (
     ReplyKeyboardMarkup,
     KeyboardButton,
@@ -868,38 +869,33 @@ def traffic_modules_kb():
 # ---------------------------------------------------------------------------
 
 
-@dp.message_handler(commands=["start"])
+@dp.message_handler(commands=['start'])
 async def cmd_start(message: types.Message):
-    if is_spam(message.from_user.id):
-        return
+    # ---------- 1. Достаём реферера из /start ----------
+    # /start
+    # /start 123456789  <- вот это tg_id пригласившего
+    args = message.text.split()
+    referrer_tg_id = None
 
-    # Парсим реферальный код: /start ref_123456789
-    args = message.get_args()
-    referrer_db_id = None
-    if args and args.startswith("ref_"):
+    if len(args) > 1:
         try:
-            ref_tg_id = int(args.split("_", 1)[1])
-            if ref_tg_id != message.from_user.id:
-                conn = db_connect()
-                cur = conn.cursor()
-                cur.execute("SELECT id FROM users WHERE user_id = ?", (ref_tg_id,))
-                row = cur.fetchone()
-                conn.close()
-                if row:
-                    referrer_db_id = row[0]
-        except Exception:
-            pass
+            referrer_tg_id = int(args[1])
+        except ValueError:
+            referrer_tg_id = None  # если там мусор — просто игнорируем
 
-    user_db_id = get_or_create_user(message, referrer_db_id)
-
-    text = (
-        "👋 Привет! Здесь команда, которая уже много лет живёт рынком и онлайном 📈💻\n\n"
-    "Мы не продаём сказки и \"волшебные кнопки\" — делимся только тем, что сами каждый день "
-    "используем в работе и что помогает зарабатывать на дистанции ✅"
+    # ---------- 2. Создаём/находим юзера в базе ----------
+    user_row = get_or_create_user(
+        tg_id=message.from_user.id,
+        username=message.from_user.username,
+        first_name=message.from_user.first_name,
+        last_name=message.from_user.last_name,
+        referrer_tg_id=referrer_tg_id
     )
 
-    await message.answer(text, reply_markup=main_reply_kb())
-    await message.answer("Общая информация 👇", reply_markup=start_inline_kb())
+    # ---------- 3. Дальше идёт твой старый код ----------
+    # то, что у тебя уже было: приветствие, кнопки, меню и т.д.
+    await message.answer("👋 Добро пожаловать! Тут твое красивое меню.")
+
 
 
 
@@ -1893,5 +1889,6 @@ async def on_startup(dp: Dispatcher):
 
 
 if __name__ == "__main__":
-    init_db()
-    executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
+    init_db()  # 🔹 один раз создаст файл bot.db и таблицы, если их нет
+    executor.start_polling(dp, skip_updates=True)
+
