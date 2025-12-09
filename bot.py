@@ -8,7 +8,6 @@ from datetime import datetime, timedelta
 import aiohttp
 from aiogram import Bot, Dispatcher, executor, types
 from auto_signals import auto_signals_worker, build_auto_signal_text
-from database import init_db, get_or_create_user
 from aiogram.types import (
     ReplyKeyboardMarkup,
     KeyboardButton,
@@ -154,6 +153,42 @@ def init_db():
     conn.close()
 
 
+def get_or_create_user(message: types.Message, referrer_id_db: int = None) -> int:
+    user_id = message.from_user.id
+    username = message.from_user.username or ""
+    first_name = message.from_user.first_name or ""
+
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id FROM users WHERE user_id = ?",
+        (user_id,),
+    )
+    row = cur.fetchone()
+
+    if row:
+        user_db_id = row[0]
+        # на всякий случай обновляем логин / имя
+        cur.execute(
+            "UPDATE users SET username = ?, first_name = ? WHERE id = ?",
+            (username, first_name, user_db_id),
+        )
+        conn.commit()
+        conn.close()
+        return user_db_id
+
+    reg_date = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    cur.execute(
+        """
+        INSERT INTO users (user_id, username, first_name, referrer_id, reg_date)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (user_id, username, first_name, referrer_id_db, reg_date),
+    )
+    conn.commit()
+    user_db_id = cur.lastrowid
+    conn.close()
+    return user_db_id
 
 
 def get_user_by_tg(user_id: int):
@@ -833,25 +868,38 @@ def traffic_modules_kb():
 # ---------------------------------------------------------------------------
 
 
-@dp.message_handler(commands=['start'])
+@dp.message_handler(commands=["start"])
 async def cmd_start(message: types.Message):
-    args = message.text.split()
-    referrer_tg_id = None
-    if len(args) > 1:
+    if is_spam(message.from_user.id):
+        return
+
+    # Парсим реферальный код: /start ref_123456789
+    args = message.get_args()
+    referrer_db_id = None
+    if args and args.startswith("ref_"):
         try:
-            referrer_tg_id = int(args[1])
-        except ValueError:
-            referrer_tg_id = None
+            ref_tg_id = int(args.split("_", 1)[1])
+            if ref_tg_id != message.from_user.id:
+                conn = db_connect()
+                cur = conn.cursor()
+                cur.execute("SELECT id FROM users WHERE user_id = ?", (ref_tg_id,))
+                row = cur.fetchone()
+                conn.close()
+                if row:
+                    referrer_db_id = row[0]
+        except Exception:
+            pass
 
-    user_row = get_or_create_user(message.from_user.id, referrer_tg_id)
+    user_db_id = get_or_create_user(message, referrer_db_id)
 
-    await message.answer("👋 Добро пожаловать! Тут будет главное меню.")
+    text = (
+        "👋 Привет! Здесь команда, которая уже много лет живёт рынком и онлайном 📈💻\n\n"
+    "Мы не продаём сказки и \"волшебные кнопки\" — делимся только тем, что сами каждый день "
+    "используем в работе и что помогает зарабатывать на дистанции ✅"
+    )
 
-
-
-
-
-
+    await message.answer(text, reply_markup=main_reply_kb())
+    await message.answer("Общая информация 👇", reply_markup=start_inline_kb())
 
 
 
@@ -1845,6 +1893,5 @@ async def on_startup(dp: Dispatcher):
 
 
 if __name__ == "__main__":
-    init_db()  # 🔹 один раз создаст файл bot.db и таблицы, если их нет
-    executor.start_polling(dp, skip_updates=True)
-
+    init_db()
+    executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
