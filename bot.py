@@ -871,30 +871,26 @@ def traffic_modules_kb():
 
 @dp.message_handler(commands=['start'])
 async def cmd_start(message: types.Message):
-    # ---------- 1. Достаём реферера из /start ----------
-    # /start
-    # /start 123456789  <- вот это tg_id пригласившего
     args = message.text.split()
     referrer_tg_id = None
-
     if len(args) > 1:
         try:
             referrer_tg_id = int(args[1])
         except ValueError:
-            referrer_tg_id = None  # если там мусор — просто игнорируем
+            referrer_tg_id = None
 
-    # ---------- 2. Создаём/находим юзера в базе ----------
+    # ВАЖНО: без имён аргументов
     user_row = get_or_create_user(
-        tg_id=message.from_user.id,
-        username=message.from_user.username,
-        first_name=message.from_user.first_name,
-        last_name=message.from_user.last_name,
-        referrer_tg_id=referrer_tg_id
+        message.from_user.id,
+        message.from_user.username,
+        message.from_user.first_name,
+        message.from_user.last_name,
+        referrer_tg_id
     )
 
-    # ---------- 3. Дальше идёт твой старый код ----------
-    # то, что у тебя уже было: приветствие, кнопки, меню и т.д.
-    await message.answer("👋 Добро пожаловать! Тут твое красивое меню.")
+    # дальше твой красивый текст / меню
+    await message.answer("👋 Добро пожаловать! Тут будет главное меню.")
+
 
 
 
