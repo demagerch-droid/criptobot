@@ -843,10 +843,10 @@ async def cmd_start(message: types.Message):
         except ValueError:
             referrer_tg_id = None
 
-    # вызываем уже функцию ИЗ database.py
     user_row = get_or_create_user(message.from_user.id, referrer_tg_id)
 
     await message.answer("👋 Добро пожаловать! Тут будет главное меню.")
+
 
 
 
