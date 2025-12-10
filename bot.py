@@ -1708,7 +1708,7 @@ async def cmd_admin(message: types.Message):
     )
     await message.answer(text)
     
-    @dp.callback_query_handler(lambda c: c.data == "admin_users")
+@dp.callback_query_handler(lambda c: c.data == "admin_users")
 async def cb_admin_users(call: CallbackQuery):
     if not is_admin(call.from_user.id):
         await call.answer()
@@ -1804,8 +1804,6 @@ async def cb_admin_export_users(call: CallbackQuery):
 
     await call.answer("Файл с пользователями отправлен", show_alert=False)
 
-
-ЯЧ
     
 @dp.message_handler(commands=["test_signal"])
 async def cmd_test_signal(message: types.Message):
