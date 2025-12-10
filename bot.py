@@ -3,6 +3,8 @@ import sqlite3
 import asyncio
 import random
 import os
+import csv
+import io
 from decimal import Decimal, ROUND_DOWN
 from datetime import datetime, timedelta
 
@@ -15,7 +17,9 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     CallbackQuery,
+    InputFile,
 )
+
 from aiogram.contrib.middlewares.logging import LoggingMiddleware
 
 # ---------------------------------------------------------------------------
@@ -783,14 +787,24 @@ COURSE_TRAFFIC = [
 # ---------------------------------------------------------------------------
 
 
-def main_reply_kb():
+def main_reply_kb(is_admin: bool = False):
     kb = ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row(
         KeyboardButton("🧠 Обучение"),
         KeyboardButton("💸 Заработок"),
         KeyboardButton("👤 Профиль"),
     )
+    # доп. кнопка только для админа
+    if is_admin:
+        kb.add(KeyboardButton("🛠 Админ панель"))
     return kb
+
+def admin_inline_kb():
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("👥 Пользователи", callback_data="admin_users"))
+    kb.add(InlineKeyboardButton("📤 Экспорт пользователей", callback_data="admin_export_users"))
+    return kb
+
 
 
 def start_inline_kb():
@@ -899,8 +913,12 @@ async def cmd_start(message: types.Message):
     "используем в работе и что помогает зарабатывать на дистанции ✅"
     )
 
-    await message.answer(text, reply_markup=main_reply_kb())
+    await message.answer(
+        text,
+        reply_markup=main_reply_kb(is_admin=is_admin(message.from_user.id)),
+    )
     await message.answer("Общая информация 👇", reply_markup=start_inline_kb())
+
 
 
 
@@ -928,6 +946,59 @@ async def msg_profile(message: types.Message):
     if is_spam(message.from_user.id):
         return
     await send_profile(message)
+    
+    @dp.message_handler(lambda m: m.text == "🛠 Админ панель")
+async def msg_admin_panel(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+
+    conn = db_connect()
+    cur = conn.cursor()
+
+    # всего пользователей
+    cur.execute("SELECT COUNT(*) FROM users")
+    total_users = cur.fetchone()[0]
+
+    # с полным доступом
+    cur.execute("SELECT COUNT(*) FROM users WHERE full_access = 1")
+    full_access_users = cur.fetchone()[0]
+
+    # активная подписка на сигналы (по дате)
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    cur.execute(
+        "SELECT COUNT(*) FROM signals_access WHERE active_until IS NOT NULL AND active_until > ?",
+        (now,),
+    )
+    active_signals = cur.fetchone()[0]
+
+    # оплаченные покупки
+    cur.execute("SELECT COUNT(*) FROM purchases WHERE status = 'paid'")
+    total_paid = cur.fetchone()[0]
+
+    cur.execute(
+        "SELECT COUNT(*) FROM purchases WHERE status = 'paid' AND product_code = 'package'"
+    )
+    paid_packages = cur.fetchone()[0]
+
+    # общий оплаченный объём
+    cur.execute("SELECT COALESCE(SUM(amount), 0) FROM purchases WHERE status = 'paid'")
+    total_volume = cur.fetchone()[0] or 0
+
+    conn.close()
+
+    text = (
+        "🔐 <b>Админ-панель</b>\n\n"
+        f"👥 Всего пользователей: <b>{total_users}</b>\n"
+        f"✅ С полным доступом: <b>{full_access_users}</b>\n"
+        f"📡 Активная подписка на сигналы: <b>{active_signals}</b>\n\n"
+        f"💳 Оплаченных покупок всего: <b>{total_paid}</b>\n"
+        f"🏷 Пакет за 100$: <b>{paid_packages}</b>\n"
+        f"💰 Общий оплаченный объём: <b>{Decimal(str(total_volume)).quantize(Decimal('0.01'))}$</b>\n\n"
+        "Выбери действие ниже 👇"
+    )
+
+    await message.answer(text, reply_markup=admin_inline_kb())
+
 
 
 # ---------------------------------------------------------------------------
@@ -1606,7 +1677,7 @@ async def cb_check_pay(call: CallbackQuery):
             "❌ Пока не вижу подходящий платёж.\n\n"
             "Убедись, что отправил <b>точно</b> указанную сумму на правильный адрес и подожди 1–3 минуты.\n"
             "Если вопрос не решится — напиши в поддержку, указав время и хэш транзакции.",
-            reply_markup=main_reply_kb(),
+            reply_markup=main_reply_kb(is_admin=is_admin(call.from_user.id)),
         )
         return
 
@@ -1636,6 +1707,105 @@ async def cmd_admin(message: types.Message):
         "/user &lt;id или @username&gt; — инфо по пользователю"
     )
     await message.answer(text)
+    
+    @dp.callback_query_handler(lambda c: c.data == "admin_users")
+async def cb_admin_users(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer()
+        return
+
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, user_id, username, first_name, full_access, reg_date
+        FROM users
+        ORDER BY id DESC
+        LIMIT 50
+        """
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        text = "👥 Пользователей пока нет."
+    else:
+        lines = ["👥 <b>Последние пользователи (до 50 шт.)</b>\n"]
+        for uid, tg_id, username, first_name, full_access, reg_date in rows:
+            name = f"@{username}" if username else (first_name or "—")
+            access = "✅" if full_access else "❌"
+            lines.append(
+                f"{uid}. {name} | TG: <code>{tg_id}</code> | full_access: {access} | {reg_date}"
+            )
+        text = "\n".join(lines)
+
+    try:
+        await call.message.edit_text(text, reply_markup=admin_inline_kb())
+    except Exception:
+        await call.message.answer(text, reply_markup=admin_inline_kb())
+
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data == "admin_export_users")
+async def cb_admin_export_users(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer()
+        return
+
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, user_id, username, first_name, referrer_id, balance, total_earned,
+               reg_date, full_access, is_blocked
+        FROM users
+        ORDER BY id ASC
+        """
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        await call.answer("Пользователей пока нет", show_alert=True)
+        return
+
+    # собираем CSV в памяти
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(
+        [
+            "id",
+            "telegram_id",
+            "username",
+            "first_name",
+            "referrer_id",
+            "balance",
+            "total_earned",
+            "reg_date",
+            "full_access",
+            "is_blocked",
+        ]
+    )
+    for row in rows:
+        writer.writerow(row)
+
+    csv_data = output.getvalue()
+    output.close()
+
+    file_bytes = io.BytesIO(csv_data.encode("utf-8-sig"))
+    filename = f"users_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
+
+    await bot.send_document(
+        call.from_user.id,
+        InputFile(file_bytes, filename),
+        caption="📤 Экспорт пользователей (CSV)",
+    )
+
+    await call.answer("Файл с пользователями отправлен", show_alert=False)
+
+
+
     
 @dp.message_handler(commands=["test_signal"])
 async def cmd_test_signal(message: types.Message):
@@ -1868,8 +2038,9 @@ async def fallback(message: types.Message):
         return
     await message.answer(
         "Не понял сообщение 🤔\nИспользуй кнопки внизу или нажми /start, чтобы вернуться в главное меню.",
-        reply_markup=main_reply_kb(),
+        reply_markup=main_reply_kb(is_admin=is_admin(message.from_user.id)),
     )
+
 
 
 # ---------------------------------------------------------------------------
