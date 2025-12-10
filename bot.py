@@ -947,7 +947,7 @@ async def msg_profile(message: types.Message):
         return
     await send_profile(message)
     
-    @dp.message_handler(lambda m: m.text == "🛠 Админ панель")
+@dp.message_handler(lambda m: m.text == "🛠 Админ панель")
 async def msg_admin_panel(message: types.Message):
     if not is_admin(message.from_user.id):
         return
@@ -1805,7 +1805,7 @@ async def cb_admin_export_users(call: CallbackQuery):
     await call.answer("Файл с пользователями отправлен", show_alert=False)
 
 
-
+ЯЧ
     
 @dp.message_handler(commands=["test_signal"])
 async def cmd_test_signal(message: types.Message):
