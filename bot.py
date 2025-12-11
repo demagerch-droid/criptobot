@@ -153,9 +153,24 @@ def init_db():
         )
         """
     )
+        # Заявки на вывод партнёрского вознаграждения
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS withdrawals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            amount REAL,
+            status TEXT,          -- 'pending', 'done', 'rejected'
+            created_at TEXT,
+            processed_at TEXT
+        )
+        """
+    )
+        я   
 
     conn.commit()
     conn.close()
+    
 
 
 def get_or_create_user(message: types.Message, referrer_id_db: int = None) -> int:
@@ -357,11 +372,51 @@ def get_referrer_chain(user_db_id: int):
     if lvl1_id:
         cur.execute("SELECT referrer_id FROM users WHERE id = ?", (lvl1_id,))
         row2 = cur.fetchone()
-        if row2:
-            lvl2_id = row2[0]
+        lvl2_id = row2[0] if row2 else None
 
     conn.close()
     return lvl1_id, lvl2_id
+
+
+def create_withdraw_request(user_db_id: int, amount: Decimal):
+    """
+    Создаём заявку на вывод партнёрского вознаграждения.
+    """
+    conn = db_connect()
+    cur = conn.cursor()
+    created_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    cur.execute(
+        """
+        INSERT INTO withdrawals (user_id, amount, status, created_at)
+        VALUES (?, ?, 'pending', ?)
+        """,
+        (user_db_id, float(amount), created_at),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_pending_withdraw(user_db_id: int):
+    """
+    Возвращаем последнюю необработанную заявку ('pending') для пользователя
+    или None, если её нет.
+    """
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, amount, status, created_at
+        FROM withdrawals
+        WHERE user_id = ? AND status = 'pending'
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (user_db_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row
+
 
 
 def save_progress(user_db_id: int, course: str, module_index: int):
@@ -1294,6 +1349,17 @@ async def cb_earn_stats(call: CallbackQuery):
     lvl1, lvl2 = count_referrals(user_db_id)
     total_refs = lvl1 + lvl2
 
+    balance_dec = Decimal(str(balance)).quantize(Decimal("0.01"))
+    total_earned_dec = Decimal(str(total_earned)).quantize(Decimal("0.01"))
+
+    pending_withdraw = get_pending_withdraw(user_db_id)
+    if pending_withdraw:
+        withdraw_status = "есть активная заявка на проверке ⏳"
+    elif balance_dec > Decimal("0"):
+        withdraw_status = "средства доступны для вывода ✅"
+    else:
+        withdraw_status = "пока выводить нечего ❌"
+
     text = (
         "📊 <b>Твоя партнёрская статистика</b>\n\n"
         f"Имя: <b>{first_name}</b>\n"
@@ -1301,14 +1367,24 @@ async def cb_earn_stats(call: CallbackQuery):
         f"Партнёров 1 уровня: <b>{lvl1}</b>\n"
         f"Партнёров 2 уровня: <b>{lvl2}</b>\n"
         f"Всего приглашено: <b>{total_refs}</b>\n\n"
-        f"Баланс к выводу: <b>{Decimal(str(balance)).quantize(Decimal('0.01'))}$</b>\n"
-        f"Всего заработано: <b>{Decimal(str(total_earned)).quantize(Decimal('0.01'))}$</b>\n\n"
-        "Статус доступа: <b>{}</b>".format("Полный доступ есть ✅" if full_access else "Полный доступ не оплачен ❌")
+        f"Баланс к выводу: <b>{balance_dec}$</b>\n"
+        f"Всего заработано: <b>{total_earned_dec}$</b>\n\n"
+        f"Статус доступа: <b>{'Полный доступ есть ✅' if full_access else 'Полный доступ не оплачен ❌'}</b>\n"
+        f"Статус вывода: <b>{withdraw_status}</b>\n\n"
+        "Как только на балансе есть деньги, ты можешь оформить заявку на вывод прямо из бота 💵"
     )
 
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton("🔗 Моя реферальная ссылка", callback_data="my_ref"))
     kb.add(InlineKeyboardButton("🏆 Топ партнёров", callback_data="earn_top"))
+
+    # Кнопка заявки на вывод:
+    # – есть полный доступ
+    # – есть баланс > 0
+    # – нет активной заявки
+    if full_access and balance_dec > Decimal("0") and not pending_withdraw:
+        kb.add(InlineKeyboardButton("💵 Заявка на вывод", callback_data="withdraw_request"))
+
     kb.add(InlineKeyboardButton("⬅️ Назад к разделу «Заработок»", callback_data="home_earn"))
 
     try:
@@ -1316,6 +1392,7 @@ async def cb_earn_stats(call: CallbackQuery):
     except Exception:
         await call.message.answer(text, reply_markup=kb)
     await call.answer()
+
 
 
 @dp.callback_query_handler(lambda c: c.data == "earn_top")
@@ -1355,6 +1432,73 @@ async def cb_earn_top(call: CallbackQuery):
     except Exception:
         await call.message.answer(text, reply_markup=kb)
     await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data == "withdraw_request")
+async def cb_withdraw_request(call: CallbackQuery):
+    user_row = get_user_by_tg(call.from_user.id)
+    if not user_row:
+        await call.answer("Сначала запусти бота через /start.", show_alert=True)
+        return
+
+    user_db_id, tg_id, username, first_name, _, balance, total_earned, full_access = user_row
+
+    if not full_access:
+        await call.answer("Заявка на вывод доступна только после покупки полного доступа.", show_alert=True)
+        return
+
+    balance_dec = Decimal(str(balance)).quantize(Decimal("0.01"))
+    if balance_dec <= Decimal("0"):
+        await call.answer("Сначала накопи баланс к выводу.", show_alert=True)
+        return
+
+    pending = get_pending_withdraw(user_db_id)
+    if pending:
+        await call.answer("У тебя уже есть активная заявка. Дождись её обработки 🙌", show_alert=True)
+        return
+
+    # 1) создаём заявку в таблице withdrawals
+    create_withdraw_request(user_db_id, balance_dec)
+
+    # 2) обнуляем баланс пользователя
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET balance = 0 WHERE id = ?", (user_db_id,))
+    conn.commit()
+    conn.close()
+
+    text = (
+        "💵 <b>Заявка на вывод отправлена</b>\n\n"
+        f"Сумма к выплате: <b>{balance_dec}$</b>\n\n"
+        "Мы получили твою заявку и передали её администратору.\n"
+        "Выплаты делаются вручную, в рабочее время.\n\n"
+        "Если прошло много времени и деньги не пришли — просто напиши в поддержку с пометкой "
+        "«вывод партнёрки»."
+    )
+
+    try:
+        await call.message.edit_text(text)
+    except Exception:
+        await call.message.answer(text)
+
+    # Уведомление админу
+    try:
+        name = f"@{username}" if username else (first_name or str(tg_id))
+        await bot.send_message(
+            ADMIN_ID,
+            "📥 <b>Новая заявка на вывод партнёрки</b>\n\n"
+            f"Пользователь: {name}\n"
+            f"TG ID: <code>{tg_id}</code>\n"
+            f"ID в БД: <code>{user_db_id}</code>\n"
+            f"Сумма: <b>{balance_dec}$</b>\n\n"
+            "После выплаты не забудь отметить заявку как обработанную "
+            "в таблице <code>withdrawals</code>.",
+        )
+    except Exception:
+        pass
+
+    await call.answer("Заявка отправлена ✅", show_alert=True)
+
 
 
 @dp.callback_query_handler(lambda c: c.data == "my_ref")
