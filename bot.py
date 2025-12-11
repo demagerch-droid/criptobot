@@ -165,8 +165,7 @@ def init_db():
             processed_at TEXT
         )
         """
-    )
-        я   
+    )   
 
     conn.commit()
     conn.close()
