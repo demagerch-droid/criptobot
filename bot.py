@@ -884,27 +884,34 @@ def back_to_edu_kb():
 def earn_main_kb():
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton("📎 Подробнее про партнёрку", callback_data="earn_more"))
-    kb.add(InlineKeyboardButton("📊 Моя статистика", callback_data="earn_stats"))
-    kb.add(InlineKeyboardButton("🏆 Топ партнёров", callback_data="earn_top"))
     kb.add(InlineKeyboardButton("📡 Канал с сигналами", callback_data="signals_channel"))
+    kb.add(InlineKeyboardButton("👤 Профиль и статистика", callback_data="home_profile"))
     kb.add(InlineKeyboardButton("💳 Открыть полный доступ ($100)", callback_data="open_access"))
     kb.add(InlineKeyboardButton("⬅️ В начало", callback_data="back_home"))
     return kb
 
 
+
 def profile_kb(has_access: bool, has_signals: bool):
     kb = InlineKeyboardMarkup()
+
+    # Верхний блок — партнёрка и статистика
+    kb.add(InlineKeyboardButton("📊 Моя статистика", callback_data="earn_stats"))
+
     if has_access:
         kb.add(InlineKeyboardButton("🔗 Моя реферальная ссылка", callback_data="my_ref"))
         if not has_signals:
             kb.add(InlineKeyboardButton("📥 Оплатить продление сигналов", callback_data="renew_signals"))
     else:
         kb.add(InlineKeyboardButton("💳 Открыть полный доступ ($100)", callback_data="open_access"))
-    kb.add(InlineKeyboardButton("🧠 Перейти к обучению", callback_data="home_edu"))
+
+    # Остальные полезные разделы
+    kb.add(InlineKeyboardButton("🏆 Топ партнёров", callback_data="earn_top"))   
     kb.add(InlineKeyboardButton("ℹ️ FAQ", callback_data="faq"))
     kb.add(InlineKeyboardButton("💬 Поддержка", callback_data="support"))
     kb.add(InlineKeyboardButton("⬅️ В начало", callback_data="back_home"))
     return kb
+
 
 
 def payment_kb(purchase_id: int, back_cb: str):
@@ -1338,7 +1345,7 @@ async def cb_earn_more(call: CallbackQuery):
 
 
 @dp.callback_query_handler(lambda c: c.data == "earn_stats")
-async def cb_earn_stats(call: CallbackQuery):
+async def   ts(call: CallbackQuery):
     user_row = get_user_by_tg(call.from_user.id)
     if not user_row:
         await call.answer("Сначала запусти бота через /start.", show_alert=True)
