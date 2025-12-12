@@ -1572,40 +1572,37 @@ async def cb_my_ref(call: CallbackQuery):
 
     user_db_id, user_tg_id, username, first_name, _, _, _, full_access = user_row
 
-    if not full_access:
-        text = (
-            "🔗 <b>Реферальная ссылка</b>\n\n"
-            "Чтобы получить реферальную ссылку, сначала открой полный доступ за <b>$100</b>."
-        )
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton("⬅️ Назад в профиль", callback_data="home_profile"))
 
+    # 1) Если доступа нет — показываем “купи доступ”
+    if not full_access:
+        text = (
+            "🔗 <b>Реферальная ссылка</b>\n\n"
+            "Чтобы получить реферальную ссылку, нужно открыть полный доступ за <b>$100</b>.\n\n"
+            "После покупки ссылка появится здесь ✅"
+        )
+    else:
+        # 2) Если доступ есть — показываем ссылку
+        me = await bot.get_me()
+        ref_link = f"https://t.me/{me.username}?start=ref_{user_tg_id}"
+
+        text = (
+            "🔗 <b>Твоя реферальная ссылка</b>\n\n"
+            f"<code>{ref_link}</code>\n\n"
+            "Делись ей с людьми, которые хотят:\n"
+            "• разобраться в трейдинге 📈\n"
+            "• научиться переливать трафик 🚀\n"
+            "• зарабатывать по партнёрской программе 🤝"
+        )
+
     try:
-        await call.message.edit_text(text, reply_markup=kb)
+        await call.message.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
     except Exception:
-        await call.message.answer(text, reply_markup=kb)
+        await call.message.answer(text, reply_markup=kb, disable_web_page_preview=True)
 
     await call.answer()
 
-    return
-
-    me = await bot.get_me()
-    ref_link = f"https://t.me/{me.username}?start=ref_{user_tg_id}"
-
-    text = (
-        "🔗 <b>Твоя реферальная ссылка</b>\n\n"
-        f"<code>{ref_link}</code>\n\n"
-        "Делись ей с людьми, которые хотят:\n"
-        "• разобраться в трейдинге\n"
-        "• научиться переливать трафик\n"
-        "• зарабатывать по партнёрской программе."
-    )
-
-    try:
-        await call.message.edit_text(text)
-    except Exception:
-        await call.message.answer(text)
-    await call.answer()
  
 @dp.callback_query_handler(lambda c: c.data == "signals_channel")
 async def cb_signals_channel(call: CallbackQuery):
