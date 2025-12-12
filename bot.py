@@ -987,7 +987,13 @@ async def cmd_start(message: types.Message):
         reply_markup=main_reply_kb(is_admin=is_admin(message.from_user.id)),
     )
     await message.answer("Узнать подрорбнее 👇", reply_markup=start_inline_kb())
+    
+    
 
+def how_back_kb():
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="back_home"))
+    return kb
 
 
 
@@ -1112,9 +1118,9 @@ async def cb_home_how(call: CallbackQuery):
 
     )
     try:
-        await call.message.edit_text(text, reply_markup=start_inline_kb())
+        await call.message.edit_text(text, reply_markup=how_back_kb())
     except Exception:
-        await call.message.answer(text, reply_markup=start_inline_kb())
+        await call.message.answer(text, reply_markup=how_back_kb())
     await call.answer()
 
 @dp.callback_query_handler(lambda c: c.data == "back_home")
