@@ -983,6 +983,7 @@ async def cmd_start(message: types.Message):
         text,
         reply_markup=main_reply_kb(is_admin=is_admin(message.from_user.id)),
     )
+    await message.answer("Общая информация 👇", reply_markup=start_inline_kb())
 
 
 
