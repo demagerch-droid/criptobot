@@ -1577,14 +1577,15 @@ async def cb_my_ref(call: CallbackQuery):
             "🔗 <b>Реферальная ссылка</b>\n\n"
             "Чтобы получить реферальную ссылку, сначала открой полный доступ за <b>$100</b>."
         )
-        kb = InlineKeyboardMarkup()
-        kb.add(InlineKeyboardButton("💳 Открыть полный доступ", callback_data="open_access"))
-        kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="home_profile"))
-        try:
-            await call.message.edit_text(text, reply_markup=kb)
-        except Exception:
-            await call.message.answer(text, reply_markup=kb)
-        await call.answer()
+            kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("⬅️ Назад в профиль", callback_data="home_profile"))
+
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await call.message.answer(text, reply_markup=kb)
+
+    await call.answer()
         return
 
     me = await bot.get_me()
