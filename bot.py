@@ -1579,7 +1579,7 @@ async def cb_my_ref(call: CallbackQuery):
         )
         kb = InlineKeyboardMarkup()
         kb.add(InlineKeyboardButton("💳 Открыть полный доступ", callback_data="open_access"))
-        kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="home_earn"))
+        kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="home_profile"))
         try:
             await call.message.edit_text(text, reply_markup=kb)
         except Exception:
