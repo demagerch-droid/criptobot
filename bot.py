@@ -1098,8 +1098,11 @@ async def cb_home_earn(call: CallbackQuery):
 
 @dp.callback_query_handler(lambda c: c.data == "home_profile")
 async def cb_home_profile(call: CallbackQuery):
-    await send_profile(call.message, edit=True)
+    fake_msg = call.message
+    fake_msg.from_user = call.from_user  # важно: подставляем реального юзера
+    await send_profile(fake_msg, edit=True)
     await call.answer()
+
 
 
 @dp.callback_query_handler(lambda c: c.data == "home_how")
