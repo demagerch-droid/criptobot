@@ -881,14 +881,19 @@ def back_to_edu_kb():
     return kb
 
 
-def earn_main_kb():
+def earn_main_kb(has_access: bool):
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton("📎 Подробнее про партнёрку", callback_data="earn_more"))
     kb.add(InlineKeyboardButton("📡 Канал с сигналами", callback_data="signals_channel"))
     kb.add(InlineKeyboardButton("👤 Профиль и статистика", callback_data="home_profile"))
-    kb.add(InlineKeyboardButton("💳 Открыть полный доступ ($100)", callback_data="open_access"))
+
+    # После покупки полного доступа скрываем кнопку оплаты
+    if not has_access:
+        kb.add(InlineKeyboardButton("💳 Открыть полный доступ ($100)", callback_data="open_access"))
+
     kb.add(InlineKeyboardButton("⬅️ В начало", callback_data="back_home"))
     return kb
+
 
 
 
@@ -1345,7 +1350,7 @@ async def cb_earn_more(call: CallbackQuery):
 
 
 @dp.callback_query_handler(lambda c: c.data == "earn_stats")
-async def   ts(call: CallbackQuery):
+async def       ts(call: CallbackQuery):
     user_row = get_user_by_tg(call.from_user.id)
     if not user_row:
         await call.answer("Сначала запусти бота через /start.", show_alert=True)
