@@ -1587,7 +1587,7 @@ async def cb_my_ref(call: CallbackQuery):
 
     await call.answer()
 
-        return
+    return
 
     me = await bot.get_me()
     ref_link = f"https://t.me/{me.username}?start=ref_{user_tg_id}"
