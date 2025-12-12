@@ -863,6 +863,7 @@ def admin_inline_kb():
 
 def start_inline_kb():
     kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("ℹ️ Как это работает", callback_data="home_how"))
     return kb
 
 
@@ -985,7 +986,7 @@ async def cmd_start(message: types.Message):
         text,
         reply_markup=main_reply_kb(is_admin=is_admin(message.from_user.id)),
     )
-    await message.answer("Общая информация 👇", reply_markup=start_inline_kb())
+    await message.answer("Узнать подрорбнее 👇", reply_markup=start_inline_kb())
 
 
 
