@@ -3,6 +3,8 @@
 import asyncio
 import random
 import logging
+import os
+import time
 from decimal import Decimal
 from typing import Optional, Sequence, List, Tuple
 from datetime import datetime
@@ -21,7 +23,15 @@ QUIET_HOURS_UTC_OFFSET = 2   # сдвиг от UTC (Киев зимой +2, ле
 
 # --- CoinGecko --- 
 
-COINGECKO_API_BASE = "https://api.coingecko.com/api/v3"
+# Если есть API key (Demo или Pro) — лимиты выше и меньше 429.
+# Demo: https://api.coingecko.com/api/v3  + header x-cg-demo-api-key
+# Pro:  https://pro-api.coingecko.com/api/v3 + header x-cg-pro-api-key
+COINGECKO_DEMO_KEY = os.getenv("COINGECKO_DEMO_KEY", "").strip()
+COINGECKO_PRO_KEY  = os.getenv("COINGECKO_PRO_KEY", "").strip()
+COINGECKO_API_BASE = "https://pro-api.coingecko.com/api/v3" if COINGECKO_PRO_KEY else "https://api.coingecko.com/api/v3"
+
+# Анти-спам к CoinGecko: если получили 429 — ставим “пауза” и не долбим дальше
+COINGECKO_COOLDOWN_UNTIL = 0.0  # time.time()
 
 # Маппинг наших пар на CoinGecko ID
 COINGECKO_IDS = {
@@ -29,6 +39,14 @@ COINGECKO_IDS = {
     "ETHUSDT": "ethereum",
     "SOLUSDT": "solana",
     "BNBUSDT": "binancecoin",
+    "XRPUSDT": "ripple",
+    "ADAUSDT": "cardano",
+    "DOGEUSDT": "dogecoin",
+    "LINKUSDT": "chainlink",
+    "DOTUSDT": "polkadot",
+    "TRXUSDT": "tron",
+    "LTCUSDT": "litecoin",
+    "MATICUSDT": "polygon",
     # если добавишь пары в AUTO_SIGNALS_SYMBOLS — не забудь дописать сюда
 }
 
@@ -59,11 +77,34 @@ async def fetch_coingecko_market_chart(coin_id: str, days: int = 3) -> Optional[
         "days": days,
     }
 
-    async with aiohttp.ClientSession() as session:
+    global COINGECKO_COOLDOWN_UNTIL
+    now_ts = time.time()
+    if COINGECKO_COOLDOWN_UNTIL and now_ts < COINGECKO_COOLDOWN_UNTIL:
+        # недавно получили 429 — даём CoinGecko “остыть”
+        return None
+
+    headers = {}
+    if COINGECKO_PRO_KEY:
+        headers["x-cg-pro-api-key"] = COINGECKO_PRO_KEY
+    elif COINGECKO_DEMO_KEY:
+        headers["x-cg-demo-api-key"] = COINGECKO_DEMO_KEY
+
+    async with aiohttp.ClientSession(headers=headers) as session:
         try:
-            async with session.get(url, params=params, timeout=10) as resp:
+            async with session.get(url, params=params, timeout=15) as resp:
+                if resp.status == 429:
+                    # Rate limit — ставим паузу (если Retry-After нет, берём 30 сек)
+                    ra = resp.headers.get("Retry-After")
+                    try:
+                        wait_s = int(ra) if ra else 30
+                    except Exception:
+                        wait_s = 30
+                    COINGECKO_COOLDOWN_UNTIL = time.time() + max(wait_s, 10)
+                    logger.warning("CoinGecko 429 rate limit for %s, cooldown %ss", coin_id, wait_s)
+                    return None
                 if resp.status != 200:
-                    logger.warning("CoinGecko market_chart %s status %s", coin_id, resp.status)
+                    txt = await resp.text()
+                    logger.warning("CoinGecko market_chart %s status %s body=%s", coin_id, resp.status, txt[:200])
                     return None
                 data = await resp.json()
         except Exception as e:
@@ -145,7 +186,36 @@ def _atr_like(values: Sequence[Decimal], period: int) -> Optional[Decimal]:
 # ---------- ПОСТРОЕНИЕ СИГНАЛА ПО СВЕЧАМ + EMA + ВОЛАТИЛЬНОСТИ ----------
 
 
-async def build_auto_signal_text(
+
+async def build_auto_signal_text(symbols: Sequence[str], enabled: bool) -> Optional[str]:
+    """
+    Обёртка: перебираем несколько пар, чтобы /test_signal и воркер не падали из‑за одной монеты,
+    отсутствующего CoinGecko ID, фильтров или временного лимита (429).
+    """
+    if not enabled:
+        return None
+
+    pairs = list(symbols) or ["BTCUSDT"]
+    random.shuffle(pairs)
+
+    # Сколько пар пробовать за один вызов (чтобы не словить 429 ещё сильнее)
+    max_tries = min(len(pairs), 8)
+
+    for pair in pairs[:max_tries]:
+        # Если мы в cooldown после 429 — не долбим дальше
+        if COINGECKO_COOLDOWN_UNTIL and time.time() < COINGECKO_COOLDOWN_UNTIL:
+            return None
+
+        text = await _build_auto_signal_text_single([pair], True)
+        if text:
+            return text
+
+        # мягкая пауза между запросами
+        await asyncio.sleep(0.8)
+
+    return None
+
+async def _build_auto_signal_text_single(
     symbols: Sequence[str],
     enabled: bool,
 ) -> Optional[str]:
@@ -277,17 +347,16 @@ async def build_auto_signal_text(
     # Красивый текст сигнала (важно: сохраняем строки Вход/Стоп/TP1/TP2 для парсера бота)
     parts = [
         f"📈 <b>Сигнал</b> по <b>{pair[:-4]}/{pair[-4:]}</b>",
-        idea_line,
-        "",
         f"📊 <b>Параметры сделки ({dir_text})</b>",
         f"Вход: <b>{_format_price(entry_low)}</b>–<b>{_format_price(entry_high)}</b> USDT",
         f"Стоп-лосс: <b>{_format_price(sl)}</b> USDT",
         f"Тейк-профит 1: <b>{_format_price(tp1)}</b> USDT",
         f"Тейк-профит 2: <b>{_format_price(tp2)}</b> USDT",
         "",
-        "🧠 TP1 → <b>безубыток</b> • часть фиксируй на TP1.",
+        f"🧬 Fibonacci: swing <b>{swing_text}</b> | зона <b>0.5–0.618</b> | цели <b>1.272/1.618</b>",
+        "🧠 После TP1 — переведи сделку в <b>безубыток</b>.",
+        "⚠️ Крипта — риск. Решения принимаешь сам.",
     ]
-
 
     return "\n".join(parts)
 
@@ -337,20 +406,10 @@ async def auto_signals_worker(
             if in_quiet:
                 logger.info("Auto signal skipped due to quiet hours (local hour=%s)", local_hour)
             else:
-                text = None
-                pairs = list(symbols) or ["BTCUSDT"]
-                random.shuffle(pairs)
-
-                for pair in pairs:
-                    text = await build_auto_signal_text([pair], enabled)
-                    if text:
-                        break
-                    await asyncio.sleep(0.2)
-
+                text = await build_auto_signal_text(symbols, enabled)
                 if text:
                     await bot.send_message(signals_channel_id, text)
                     logger.info("Auto signal sent to %s", signals_channel_id)
-
         except Exception as e:
             logger.error("Auto signals worker error: %s", e)
 
