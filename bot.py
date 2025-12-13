@@ -5,12 +5,14 @@ import random
 import os
 import csv
 import io
+import re
 from decimal import Decimal, ROUND_DOWN
 from datetime import datetime, timedelta
+from typing import Optional, Dict, List, Tuple, Sequence
 
 import aiohttp
 from aiogram import Bot, Dispatcher, executor, types
-from auto_signals import auto_signals_worker, build_auto_signal_text
+from auto_signals import auto_signals_worker, build_auto_signal_text, COINGECKO_IDS, QUIET_HOURS_ENABLED, QUIET_HOURS_START, QUIET_HOURS_END, QUIET_HOURS_UTC_OFFSET
 from aiogram.types import (
     ReplyKeyboardMarkup,
     KeyboardButton,
@@ -137,6 +139,33 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER UNIQUE,      -- ссылка на users.id
             active_until TEXT            -- UTC datetime (YYYY-mm-dd HH:MM:SS)
+        )
+        """
+    )
+
+    
+    # Сигналы (для авто-отслеживания TP/SL)
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS signal_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel_message_id INTEGER UNIQUE,
+            symbol TEXT,
+            direction TEXT,               -- 'LONG' / 'SHORT'
+            entry_low REAL,
+            entry_high REAL,
+            sl REAL,
+            tp1 REAL,
+            tp2 REAL,
+            status TEXT DEFAULT 'pending',   -- 'pending' / 'active' / 'closed'
+            tp1_hit INTEGER DEFAULT 0,
+            tp2_hit INTEGER DEFAULT 0,
+            sl_hit INTEGER DEFAULT 0,
+            created_at TEXT,
+            activated_at TEXT,
+            closed_at TEXT,
+            last_price REAL,
+            last_checked_at TEXT
         )
         """
     )
@@ -341,6 +370,407 @@ def get_signals_until(user_db_id: int):
     except Exception:
         return None
 
+
+
+# ---------------------------------------------------------------------------
+# АВТО-ОТСЛЕЖИВАНИЕ TP/SL (автоматические посты о закрытии тейков)
+# ---------------------------------------------------------------------------
+
+def _strip_tags(s: str) -> str:
+    if not s:
+        return ""
+    # Telegram хранит entities, но на входе у нас может быть HTML-строка.
+    return re.sub(r"<[^>]+>", "", s)
+
+def _to_decimal(s: str) -> Optional[Decimal]:
+    try:
+        return Decimal(s.replace(",", ".").strip())
+    except Exception:
+        return None
+
+def parse_signal_from_text(text: str) -> Optional[Dict[str, object]]:
+    """Парсим текст сигнала (и HTML, и обычный текст) -> параметры сделки."""
+    plain = _strip_tags(text)
+
+    # Пара: BTC/USDT
+    m = re.search(r"Сигнал\s*по\s*([A-Z0-9]{2,12})\s*/\s*([A-Z0-9]{2,12})", plain)
+    if not m:
+        return None
+    base, quote = m.group(1), m.group(2)
+    symbol = f"{base}{quote}".upper()
+
+    # Направление LONG/SHORT
+    m = re.search(r"Параметры\s+сделки\s*\((LONG|SHORT)\)", plain, re.IGNORECASE)
+    if not m:
+        return None
+    direction = m.group(1).upper()
+
+    # Вход: 123–456 (допускаем '-' или '–')
+    m = re.search(r"Вход:\s*([0-9][0-9\.,]*)\s*[–\-]\s*([0-9][0-9\.,]*)", plain)
+    if not m:
+        return None
+    entry_low = _to_decimal(m.group(1))
+    entry_high = _to_decimal(m.group(2))
+
+    m = re.search(r"Стоп-лосс:\s*([0-9][0-9\.,]*)", plain)
+    sl = _to_decimal(m.group(1)) if m else None
+
+    m = re.search(r"Тейк-профит\s*1:\s*([0-9][0-9\.,]*)", plain)
+    tp1 = _to_decimal(m.group(1)) if m else None
+
+    m = re.search(r"Тейк-профит\s*2:\s*([0-9][0-9\.,]*)", plain)
+    tp2 = _to_decimal(m.group(1)) if m else None
+
+    if not (entry_low and entry_high and sl and tp1 and tp2):
+        return None
+
+    return {
+        "symbol": symbol,
+        "base": base,
+        "quote": quote,
+        "direction": direction,
+        "entry_low": entry_low,
+        "entry_high": entry_high,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+    }
+
+def save_signal_trade(channel_message_id: int, text: str) -> bool:
+    """Сохраняем сигнал в БД для дальнейшего мониторинга. True если сохранили."""
+    data = parse_signal_from_text(text)
+    if not data:
+        return False
+
+    created_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    conn = db_connect()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            INSERT OR IGNORE INTO signal_trades
+            (channel_message_id, symbol, direction, entry_low, entry_high, sl, tp1, tp2, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(channel_message_id),
+                str(data["symbol"]),
+                str(data["direction"]),
+                float(data["entry_low"]),
+                float(data["entry_high"]),
+                float(data["sl"]),
+                float(data["tp1"]),
+                float(data["tp2"]),
+                created_at,
+            ),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+def _get_open_trades() -> List[Tuple]:
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, channel_message_id, symbol, direction,
+               entry_low, entry_high, sl, tp1, tp2,
+               status, tp1_hit, tp2_hit, sl_hit, activated_at
+        FROM signal_trades
+        WHERE status != 'closed'
+        ORDER BY id ASC
+        """
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows or []
+
+def _update_trade_status(trade_id: int, **fields):
+    if not fields:
+        return
+    cols = []
+    vals = []
+    for k, v in fields.items():
+        cols.append(f"{k} = ?")
+        vals.append(v)
+    vals.append(trade_id)
+
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(f"UPDATE signal_trades SET {', '.join(cols)} WHERE id = ?", vals)
+    conn.commit()
+    conn.close()
+
+def get_active_signals_tg_ids() -> List[int]:
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT u.user_id
+        FROM signals_access sa
+        JOIN users u ON sa.user_id = u.id
+        WHERE sa.active_until IS NOT NULL AND sa.active_until > ?
+        """,
+        (now,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return [int(r[0]) for r in rows if r and r[0] is not None]
+
+async def broadcast_to_active_signals(text: str, kb: Optional[InlineKeyboardMarkup] = None):
+    for tg_id in get_active_signals_tg_ids():
+        try:
+            await bot.send_message(tg_id, text, reply_markup=kb, disable_web_page_preview=True)
+        except Exception:
+            pass
+        await asyncio.sleep(0.05)
+
+async def _fetch_binance_price(session: aiohttp.ClientSession, symbol: str) -> Optional[Decimal]:
+    url = "https://api.binance.com/api/v3/ticker/price"
+    try:
+        async with session.get(url, params={"symbol": symbol}, timeout=10) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json()
+            p = data.get("price")
+            return _to_decimal(str(p)) if p is not None else None
+    except Exception:
+        return None
+
+async def _fetch_coingecko_price(session: aiohttp.ClientSession, symbol: str) -> Optional[Decimal]:
+    # CoinGecko отдаёт USD, для USDT это почти то же.
+    coin_id = COINGECKO_IDS.get(symbol)
+    if not coin_id:
+        return None
+    url = "https://api.coingecko.com/api/v3/simple/price"
+    try:
+        async with session.get(url, params={"ids": coin_id, "vs_currencies": "usd"}, timeout=10) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json()
+            usd = (data.get(coin_id) or {}).get("usd")
+            return _to_decimal(str(usd)) if usd is not None else None
+    except Exception:
+        return None
+
+async def fetch_price(session: aiohttp.ClientSession, symbol: str) -> Optional[Decimal]:
+    p = await _fetch_binance_price(session, symbol)
+    if p is not None:
+        return p
+    return await _fetch_coingecko_price(session, symbol)
+
+def _fmt_pct(x: Decimal) -> str:
+    try:
+        return str(x.quantize(Decimal("0.01")))
+    except Exception:
+        return str(x)
+
+
+def _fmt_price(p: Decimal) -> str:
+    """Формат цены с разумным количеством знаков."""
+    try:
+        if p >= Decimal("100"):
+            q = p.quantize(Decimal("0.1"))
+        elif p >= Decimal("1"):
+            q = p.quantize(Decimal("0.01"))
+        elif p >= Decimal("0.1"):
+            q = p.quantize(Decimal("0.001"))
+        else:
+            q = p.quantize(Decimal("0.0001"))
+        return str(q)
+    except Exception:
+        return str(p)
+
+async def _post_trade_update(channel_message_id: int, text: str):
+    # Постим в канал ответом на исходный сигнал + рассылаем подписчикам
+    try:
+        await bot.send_message(
+            SIGNALS_CHANNEL_ID,
+            text,
+            reply_to_message_id=channel_message_id,
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        try:
+            await bot.send_message(SIGNALS_CHANNEL_ID, text, disable_web_page_preview=True)
+        except Exception:
+            pass
+
+    await broadcast_to_active_signals(text)
+
+async def tp_monitor_worker():
+    """Фоновый воркер: следит за активными сигналами и сам пишет про TP/SL."""
+    await asyncio.sleep(10)
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                trades = _get_open_trades()
+                if not trades:
+                    await asyncio.sleep(20)
+                    continue
+
+                # цены получаем по уникальным символам
+                symbols = sorted({t[2] for t in trades if t[2]})
+                prices: Dict[str, Decimal] = {}
+                for sym in symbols:
+                    p = await fetch_price(session, sym)
+                    if p is not None:
+                        prices[sym] = p
+                    await asyncio.sleep(0.05)
+
+                now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+                for (
+                    trade_id, msg_id, symbol, direction,
+                    entry_low_f, entry_high_f, sl_f, tp1_f, tp2_f,
+                    status, tp1_hit, tp2_hit, sl_hit, activated_at
+                ) in trades:
+
+                    price = prices.get(symbol)
+                    if price is None:
+                        _update_trade_status(trade_id, last_checked_at=now_str)
+                        continue
+
+                    entry_low = Decimal(str(entry_low_f))
+                    entry_high = Decimal(str(entry_high_f))
+                    sl = Decimal(str(sl_f))
+                    tp1 = Decimal(str(tp1_f))
+                    tp2 = Decimal(str(tp2_f))
+                    dir_u = (direction or "").upper()
+
+                    # pending -> active, когда цена вошла в зону входа
+                    if status == "pending":
+                        if entry_low <= price <= entry_high:
+                            _update_trade_status(
+                                trade_id,
+                                status="active",
+                                activated_at=now_str,
+                                last_price=float(price),
+                                last_checked_at=now_str,
+                            )
+                        else:
+                            _update_trade_status(trade_id, last_price=float(price), last_checked_at=now_str)
+                        continue
+
+                    if status == "closed":
+                        continue
+
+                    entry_mid = (entry_low + entry_high) / Decimal("2")
+
+                    def profit_pct(target: Decimal) -> Decimal:
+                        if dir_u == "LONG":
+                            return (target - entry_mid) / entry_mid * Decimal("100")
+                        return (entry_mid - target) / entry_mid * Decimal("100")
+
+                    tp1_hit_b = bool(tp1_hit)
+                    tp2_hit_b = bool(tp2_hit)
+                    sl_hit_b = bool(sl_hit)
+
+                    # СТОП
+                    sl_trigger = (price <= sl) if dir_u == "LONG" else (price >= sl)
+                    if (not sl_hit_b) and sl_trigger:
+                        pct = (sl - entry_mid) / entry_mid * Decimal("100") if dir_u == "LONG" else (entry_mid - sl) / entry_mid * Decimal("100")
+                        text = (
+                            f"🛑 <b>Стоп-лосс сработал</b> ({symbol})\n"
+                            f"Цена: <b>{price}</b>\n"
+                            f"Результат от входа: <b>{_fmt_pct(pct)}%</b>"
+                        )
+                        await _post_trade_update(int(msg_id), text)
+                        _update_trade_status(
+                            trade_id,
+                            sl_hit=1,
+                            status="closed",
+                            closed_at=now_str,
+                            last_price=float(price),
+                            last_checked_at=now_str,
+                        )
+                        continue
+
+                    # TP1
+                    tp1_trigger = (price >= tp1) if dir_u == "LONG" else (price <= tp1)
+                    if (not tp1_hit_b) and tp1_trigger:
+                        pct = profit_pct(tp1)
+                        text = (
+                            f"🎯 <b>TP1 закрыт</b> ✅ ({symbol})\n"
+                            f"Цена: <b>{price}</b>\n"
+                            f"Профит от входа: <b>+{_fmt_pct(pct)}%</b>\n"
+                            f"Держим дальше до TP2 💎"
+                        )
+                        await _post_trade_update(int(msg_id), text)
+                        _update_trade_status(trade_id, tp1_hit=1, last_price=float(price), last_checked_at=now_str)
+
+                    # TP2 (финал)
+                    tp2_trigger = (price >= tp2) if dir_u == "LONG" else (price <= tp2)
+                    if (not tp2_hit_b) and tp2_trigger:
+                        pct = profit_pct(tp2)
+                        text = (
+                            f"🏁 <b>TP2 закрыт</b> ✅ ({symbol})\n"
+                            f"Цена: <b>{price}</b>\n"
+                            f"Профит от входа: <b>+{_fmt_pct(pct)}%</b>\n"
+                            f"Сделка закрыта полностью 🎉"
+                        )
+                        await _post_trade_update(int(msg_id), text)
+                        _update_trade_status(
+                            trade_id,
+                            tp2_hit=1,
+                            status="closed",
+                            closed_at=now_str,
+                            last_price=float(price),
+                            last_checked_at=now_str,
+                        )
+                        continue
+
+                    _update_trade_status(trade_id, last_price=float(price), last_checked_at=now_str)
+
+            except Exception as e:
+                logger.exception("tp_monitor_worker error: %s", e)
+
+            await asyncio.sleep(20)
+
+async def auto_signals_worker_tracked(
+    bot: Bot,
+    signals_channel_id: int,
+    auto_signals_per_day: int,
+    symbols: Sequence[str],
+    enabled: bool,
+) -> None:
+    """Как auto_signals_worker, но с сохранением сигнала в БД для TP/SL."""
+    if not enabled:
+        logger.info("Auto signals disabled, worker not started.")
+        return
+    if not isinstance(signals_channel_id, int):
+        logger.warning("signals_channel_id is not int, auto-signals disabled.")
+        return
+
+    interval = int(24 * 3600 / max(auto_signals_per_day, 1))
+    await asyncio.sleep(15)
+
+    while True:
+        try:
+            now_utc = datetime.utcnow()
+            local_hour = (now_utc.hour + QUIET_HOURS_UTC_OFFSET) % 24
+
+            in_quiet = False
+            if QUIET_HOURS_ENABLED:
+                if QUIET_HOURS_START <= QUIET_HOURS_END:
+                    in_quiet = QUIET_HOURS_START <= local_hour < QUIET_HOURS_END
+                else:
+                    in_quiet = local_hour >= QUIET_HOURS_START or local_hour < QUIET_HOURS_END
+
+            if not in_quiet:
+                text = await build_auto_signal_text(symbols, enabled)
+                if text:
+                    msg = await bot.send_message(signals_channel_id, text)
+                    save_signal_trade(msg.message_id, text)
+                    logger.info("Auto signal sent+saved (msg_id=%s).", msg.message_id)
+            else:
+                logger.info("Auto signal skipped due to quiet hours (local hour=%s)", local_hour)
+        except Exception as e:
+            logger.error("Auto signals tracked worker error: %s", e)
+
+        await asyncio.sleep(interval)
 
 def add_balance(user_db_id: int, amount: Decimal):
     conn = db_connect()
@@ -953,6 +1383,20 @@ def traffic_modules_kb():
 # /START + РЕФЕРАЛКА
 # ---------------------------------------------------------------------------
 
+
+
+# ---------------------------------------------------------------------------
+# CHANNEL: если сигнал публикуется вручную в канале (в нашем формате) — сохраняем его для TP/SL
+# ---------------------------------------------------------------------------
+
+@dp.channel_post_handler(content_types=types.ContentType.TEXT)
+async def channel_capture_signal_posts(message: types.Message):
+    if message.chat.id != SIGNALS_CHANNEL_ID:
+        return
+    try:
+        save_signal_trade(message.message_id, message.text or "")
+    except Exception:
+        pass
 
 @dp.message_handler(commands=["start"])
 async def cmd_start(message: types.Message):
@@ -2039,7 +2483,8 @@ async def cmd_test_signal(message: types.Message):
         return
 
     try:
-        await bot.send_message(SIGNALS_CHANNEL_ID, text)
+        msg = await bot.send_message(SIGNALS_CHANNEL_ID, text)
+        save_signal_trade(msg.message_id, text)
         await message.answer("✅ Тестовый авто-сигнал отправлен в канал.")
     except Exception as e:
         await message.answer(f"❌ Ошибка при отправке в канал.\nПроверь права бота и ID канала.")
@@ -2265,8 +2710,9 @@ async def fallback(message: types.Message):
 async def on_startup(dp: Dispatcher):
     init_db()
     asyncio.create_task(signals_watcher())
+    asyncio.create_task(tp_monitor_worker())
     asyncio.create_task(
-        auto_signals_worker(
+        auto_signals_worker_tracked(
             bot,
             SIGNALS_CHANNEL_ID,
             AUTO_SIGNALS_PER_DAY,
