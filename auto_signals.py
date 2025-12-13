@@ -144,16 +144,19 @@ def _atr_like(values: Sequence[Decimal], period: int) -> Optional[Decimal]:
 
 # ---------- ПОСТРОЕНИЕ СИГНАЛА ПО СВЕЧАМ + EMA + ВОЛАТИЛЬНОСТИ ----------
 
+
 async def build_auto_signal_text(
     symbols: Sequence[str],
     enabled: bool,
 ) -> Optional[str]:
     """
     Генерация авто-сигнала на основе:
-    • исторических данных с CoinGecko (серия закрытий)
-    • EMA20 / EMA50 (тренд)
-    • ATR-подобной волатильности за 14 интервалов
-    • фильтров по тренду и волатильности
+    • исторических данных с CoinGecko (серия закрытий ~1H)
+    • EMA20 / EMA50 (фильтр тренда)
+    • ATR-подобной волатильности (по закрытиям)
+    • уровней Fibonacci (retracement 0.5–0.618, targets 1.272/1.618)
+
+    Важно: это не «гарантия профита», а форматирование сигналов по понятной системе.
     """
     if not enabled:
         return None
@@ -166,14 +169,13 @@ async def build_auto_signal_text(
         logger.warning("No CoinGecko ID for pair %s", pair)
         return None
 
-    # Берём ~3 дня истории, там будут почасовые точки
+    # Берём ~3 дня истории (на бесплатном плане CoinGecko обычно отдаёт почасовые точки)
     series = await fetch_coingecko_market_chart(coin_id, days=3)
     if not series:
         return None
 
     closes = [p for _, p in series]
-    if len(closes) < max(SLOW_EMA_PERIOD, ATR_PERIOD) + 5:
-        # мало данных, лучше ничего не давать, чем городить мусор
+    if len(closes) < max(SLOW_EMA_PERIOD, ATR_PERIOD) + 10:
         return None
 
     last_close = closes[-1]
@@ -187,78 +189,115 @@ async def build_auto_signal_text(
     if atr is None or atr <= 0:
         return None
 
-    # Сила тренда относительно медленной EMA
+    # Сила тренда относительно EMA50
     trend_pct = (last_close - ema_slow) / last_close * Decimal("100")
-    # Средняя волатильность в процентах
     atr_pct = atr / last_close * Decimal("100")
 
     # Фильтр по волатильности
     if atr_pct < MIN_ATR_PCT or atr_pct > MAX_ATR_PCT:
-        # либо слишком скучно, либо слишком бешено — пропускаем
         return None
 
+    # Направление по тренду
     direction = None
-    idea_lines = []
-
-    # Фильтр по тренду: цена + EMA20 + EMA50 должны смотреть в одну сторону
+    idea_line = None
     if trend_pct > MIN_TREND_PCT and ema_fast > ema_slow:
         direction = "long"
-        idea_lines.append("🟢 Идея: LONG по тренду (цена выше EMA, бычий наклон).")
+        idea_line = "🟢 Идея: <b>LONG по тренду</b> (EMA20 выше EMA50)."
     elif trend_pct < -MIN_TREND_PCT and ema_fast < ema_slow:
         direction = "short"
-        idea_lines.append("🔴 Идея: SHORT по тренду (цена ниже EMA, медвежий наклон).")
+        idea_line = "🔴 Идея: <b>SHORT по тренду</b> (EMA20 ниже EMA50)."
     else:
-        # тренд слабый/размазанный — не даём сигнал
         return None
 
-    # Разные настройки для BTC/ETH и альтов
-    if pair in ("BTCUSDT", "ETHUSDT"):
-        sl_mult = Decimal("1.5")   # стоп ~1.5 ATR
-        tp1_mult = Decimal("1.5")  # TP1 ~1.5 ATR
-        tp2_mult = Decimal("3")    # TP2 ~3 ATR
-    else:
-        sl_mult = Decimal("1.8")   # альты агрессивнее
-        tp1_mult = Decimal("2")
-        tp2_mult = Decimal("4")
+    # --- Fibonacci swing (по закрытиям) ---
+    SWING_LOOKBACK = 60  # ~60 часов
+    lookback = min(SWING_LOOKBACK, len(closes))
+    window = closes[-lookback:]
 
-    entry_mid = last_close
-    entry_zone = atr * Decimal("0.5")  # вход диапазоном ≈ пол-ATR
+    # Импульс для фибо: LONG -> low→high, SHORT -> high→low
+    if direction == "long":
+        swing_low = min(window)
+        low_i = window.index(swing_low)
+        swing_high = max(window[low_i:]) if low_i < len(window) else max(window)
+    else:
+        swing_high = max(window)
+        high_i = window.index(swing_high)
+        swing_low = min(window[high_i:]) if high_i < len(window) else min(window)
+
+    if swing_high <= swing_low:
+        return None
+
+    swing_range = swing_high - swing_low
+
+    # чтобы не строить фибо на «пустом месте»
+    MIN_SWING_ATR_MULT = Decimal("2")
+    if swing_range < atr * MIN_SWING_ATR_MULT:
+        return None
+
+    # Уровни retracement
+    r382 = Decimal("0.382")
+    r50 = Decimal("0.5")
+    r618 = Decimal("0.618")
+    r786 = Decimal("0.786")
+
+    # Targets extension
+    ext1 = Decimal("1.272")
+    ext2 = Decimal("1.618")
+
+    # буфер для стопа
+    sl_buffer = atr * Decimal("0.25")
 
     if direction == "long":
-        entry_low = entry_mid - entry_zone
-        entry_high = entry_mid
-        sl = entry_mid - sl_mult * atr
-        tp1 = entry_mid + tp1_mult * atr
-        tp2 = entry_mid + tp2_mult * atr
-        dir_text = "LONG"
-    else:
-        entry_low = entry_mid
-        entry_high = entry_mid + entry_zone
-        sl = entry_mid + sl_mult * atr
-        tp1 = entry_mid - tp1_mult * atr
-        tp2 = entry_mid - tp2_mult * atr
-        dir_text = "SHORT"
+        fib_382 = swing_high - swing_range * r382
+        fib_50 = swing_high - swing_range * r50
+        fib_618 = swing_high - swing_range * r618
+        fib_786 = swing_high - swing_range * r786
 
+        entry_low = min(fib_618, fib_50)
+        entry_high = max(fib_618, fib_50)
+        sl = fib_786 - sl_buffer
+        tp1 = swing_high + swing_range * (ext1 - Decimal("1"))
+        tp2 = swing_high + swing_range * (ext2 - Decimal("1"))
+        dir_text = "LONG"
+        swing_text = f"{_format_price(swing_low)} → {_format_price(swing_high)}"
+    else:
+        fib_382 = swing_low + swing_range * r382
+        fib_50 = swing_low + swing_range * r50
+        fib_618 = swing_low + swing_range * r618
+        fib_786 = swing_low + swing_range * r786
+
+        entry_low = min(fib_50, fib_618)
+        entry_high = max(fib_50, fib_618)
+        sl = fib_786 + sl_buffer
+        tp1 = swing_low - swing_range * (ext1 - Decimal("1"))
+        tp2 = swing_low - swing_range * (ext2 - Decimal("1"))
+        dir_text = "SHORT"
+        swing_text = f"{_format_price(swing_high)} → {_format_price(swing_low)}"
+
+    # Красивый текст сигнала (важно: сохраняем строки Вход/Стоп/TP1/TP2 для парсера бота)
     parts = [
         f"📈 <b>Сигнал</b> по <b>{pair[:-4]}/{pair[-4:]}</b>",
-        f"Текущая цена (закрытие последнего интервала): <b>{_format_price(last_close)}</b> USDT",
-        f"Сила тренда относительно EMA{SLOW_EMA_PERIOD}: <b>{_format_pct(trend_pct)}%</b>",
-        f"Средняя волатильность за {ATR_PERIOD} интервалов: <b>{_format_pct(atr_pct)}%</b> за свечу",
+        f"🕒 Таймфрейм: <b>1H</b> (данные CoinGecko)",
+        f"💵 Текущая цена: <b>{_format_price(last_close)}</b> USDT",
+        f"📉 Волатильность (ATR~): <b>{_format_pct(atr_pct)}%</b> / свеча",
+        f"📈 Тренд к EMA{SLOW_EMA_PERIOD}: <b>{_format_pct(trend_pct)}%</b>",
         "",
+        idea_line,
+        "",
+        "🧬 <b>Fibonacci</b>",
+        f"• Импульс (swing): <b>{swing_text}</b>",
+        "• Зона входа: <b>0.5–0.618</b> (откат)",
+        "• Цели: <b>1.272</b> и <b>1.618</b> (extension)",
+        "",
+        f"📊 <b>Параметры сделки ({dir_text})</b>",
+        f"Вход: <b>{_format_price(entry_low)}</b>–<b>{_format_price(entry_high)}</b> USDT",
+        f"Стоп-лосс: <b>{_format_price(sl)}</b> USDT",
+        f"Тейк-профит 1: <b>{_format_price(tp1)}</b> USDT",
+        f"Тейк-профит 2: <b>{_format_price(tp2)}</b> USDT",
+        "",
+        "🧠 Рекомендация: фиксируй часть на TP1 и переводи сделку в <b>безубыток</b>.",
+        "⚠️ Риск-менеджмент: не рискуй более 3–6% депозита на сделку и всегда используй стоп-лосс.",
     ]
-    parts.extend(idea_lines)
-    parts.extend(
-        [
-            "",
-            f"📊 <b>Параметры сделки ({dir_text})</b>",
-            f"Вход: <b>{_format_price(entry_low)}</b>–<b>{_format_price(entry_high)}</b> USDT",
-            f"Стоп-лосс: <b>{_format_price(sl)}</b> USDT",
-            f"Тейк-профит 1: <b>{_format_price(tp1)}</b> USDT",
-            f"Тейк-профит 2: <b>{_format_price(tp2)}</b> USDT",
-            "",
-            "Риск-менеджмент: не рискуй более 3-6% депозита на сделку и всегда используй стоп-лосс.",
-        ]
-    )
 
     return "\n".join(parts)
 
