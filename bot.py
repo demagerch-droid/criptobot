@@ -58,7 +58,12 @@ SIGNALS_CHANNEL_LINK = "https://t.me/+uScs9-WDtW5hYTIy"  # 👈 сюда реа�
 # Авто-сигналы
 AUTO_SIGNALS_ENABLED = True          # если захочешь вырубить — поставишь False
 AUTO_SIGNALS_PER_DAY = 5             # примерно сколько сигналов в сутки
-AUTO_SIGNALS_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]  # пары для сигналов
+AUTO_SIGNALS_SYMBOLS = [  # пары для сигналов
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT",
+    "XRPUSDT", "ADAUSDT", "DOGEUSDT", "LTCUSDT",
+    "TRXUSDT", "DOTUSDT", "LINKUSDT", "MATICUSDT",
+]
+  # пары для сигналов
 
 # Ссылки на обучающие каналы
 TRADING_EDU_CHANNEL = "https://t.me/+RPev0hkFwjk5MmQy"
@@ -2497,13 +2502,18 @@ async def cmd_test_signal(message: types.Message):
 
     await message.answer("⏳ Генерирую тестовый авто-сигнал...")
 
-    text = await build_auto_signal_text(
-        AUTO_SIGNALS_SYMBOLS,
-        True,  # включено принудительно
-    )
+    text = None
+    pairs = list(AUTO_SIGNALS_SYMBOLS) or ["BTCUSDT"]
+    random.shuffle(pairs)
+
+    for pair in pairs:
+        text = await build_auto_signal_text([pair], True)
+        if text:
+            break
+        await asyncio.sleep(0.2)
 
     if not text:
-        await message.answer("❌ Не удалось сгенерировать авто-сигнал (нет данных от Binance или ошибка).")
+        await message.answer("❌ Сейчас нет подходящего сетапа (фильтры не прошли) или нет данных от CoinGecko. Попробуй позже.")
         return
 
     try:

@@ -277,17 +277,7 @@ async def build_auto_signal_text(
     # Красивый текст сигнала (важно: сохраняем строки Вход/Стоп/TP1/TP2 для парсера бота)
     parts = [
         f"📈 <b>Сигнал</b> по <b>{pair[:-4]}/{pair[-4:]}</b>",
-        f"🕒 Таймфрейм: <b>1H</b> (данные CoinGecko)",
-        f"💵 Текущая цена: <b>{_format_price(last_close)}</b> USDT",
-        f"📉 Волатильность (ATR~): <b>{_format_pct(atr_pct)}%</b> / свеча",
-        f"📈 Тренд к EMA{SLOW_EMA_PERIOD}: <b>{_format_pct(trend_pct)}%</b>",
-        "",
         idea_line,
-        "",
-        "🧬 <b>Fibonacci</b>",
-        f"• Импульс (swing): <b>{swing_text}</b>",
-        "• Зона входа: <b>0.5–0.618</b> (откат)",
-        "• Цели: <b>1.272</b> и <b>1.618</b> (extension)",
         "",
         f"📊 <b>Параметры сделки ({dir_text})</b>",
         f"Вход: <b>{_format_price(entry_low)}</b>–<b>{_format_price(entry_high)}</b> USDT",
@@ -295,9 +285,9 @@ async def build_auto_signal_text(
         f"Тейк-профит 1: <b>{_format_price(tp1)}</b> USDT",
         f"Тейк-профит 2: <b>{_format_price(tp2)}</b> USDT",
         "",
-        "🧠 Рекомендация: фиксируй часть на TP1 и переводи сделку в <b>безубыток</b>.",
-        "⚠️ Риск-менеджмент: не рискуй более 3–6% депозита на сделку и всегда используй стоп-лосс.",
+        "🧠 TP1 → <b>безубыток</b> • часть фиксируй на TP1.",
     ]
+
 
     return "\n".join(parts)
 
@@ -347,10 +337,20 @@ async def auto_signals_worker(
             if in_quiet:
                 logger.info("Auto signal skipped due to quiet hours (local hour=%s)", local_hour)
             else:
-                text = await build_auto_signal_text(symbols, enabled)
+                text = None
+                pairs = list(symbols) or ["BTCUSDT"]
+                random.shuffle(pairs)
+
+                for pair in pairs:
+                    text = await build_auto_signal_text([pair], enabled)
+                    if text:
+                        break
+                    await asyncio.sleep(0.2)
+
                 if text:
                     await bot.send_message(signals_channel_id, text)
                     logger.info("Auto signal sent to %s", signals_channel_id)
+
         except Exception as e:
             logger.error("Auto signals worker error: %s", e)
 
