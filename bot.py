@@ -671,12 +671,25 @@ async def tp_monitor_worker():
                     # СТОП
                     sl_trigger = (price <= sl) if dir_u == "LONG" else (price >= sl)
                     if (not sl_hit_b) and sl_trigger:
-                        pct = (sl - entry_mid) / entry_mid * Decimal("100") if dir_u == "LONG" else (entry_mid - sl) / entry_mid * Decimal("100")
-                        text = (
-                            f"🛑 <b>Стоп-лосс сработал</b> ({symbol})\n"
-                            f"Цена: <b>{price}</b>\n"
-                            f"Результат от входа: <b>{_fmt_pct(pct)}%</b>"
-                        )
+                        # Если после TP1 мы перенесли SL в безубыток (SL ≈ entry_mid) — закрываем как BE
+                        be_threshold = Decimal("0.0005")  # 0.05% допуска из-за округлений
+                        is_be = tp1_hit_b and (abs(sl - entry_mid) / entry_mid <= be_threshold)
+
+                        if is_be:
+                            text = (
+                                f"🔒 <b>Безубыток</b> ({symbol})\n"
+                                f"Цена вернулась к входу — сделка закрыта в <b>{_fmt_pct(Decimal('0'))}%</b>\n"
+                                f"Цена: <b>{price}</b>\n"
+                                f"Вход (BE): <b>{_fmt_price(entry_mid)}</b>"
+                            )
+                        else:
+                            pct = (sl - entry_mid) / entry_mid * Decimal("100") if dir_u == "LONG" else (entry_mid - sl) / entry_mid * Decimal("100")
+                            text = (
+                                f"🛑 <b>Стоп-лосс сработал</b> ({symbol})\n"
+                                f"Цена: <b>{price}</b>\n"
+                                f"Результат от входа: <b>{_fmt_pct(pct)}%</b>"
+                            )
+
                         await _post_trade_update(int(msg_id), text)
                         _update_trade_status(
                             trade_id,
@@ -692,14 +705,25 @@ async def tp_monitor_worker():
                     tp1_trigger = (price >= tp1) if dir_u == "LONG" else (price <= tp1)
                     if (not tp1_hit_b) and tp1_trigger:
                         pct = profit_pct(tp1)
+
+                        # Переводим стоп в безубыток после TP1 (по середине зоны входа)
+                        be_price = entry_mid
+
                         text = (
                             f"🎯 <b>TP1 закрыт</b> ✅ ({symbol})\n"
                             f"Цена: <b>{price}</b>\n"
                             f"Профит от входа: <b>+{_fmt_pct(pct)}%</b>\n"
+                            f"🔒 Стоп перенесён в <b>безубыток</b>: <b>{_fmt_price(be_price)}</b>\n"
                             f"Держим дальше до TP2 💎"
                         )
                         await _post_trade_update(int(msg_id), text)
-                        _update_trade_status(trade_id, tp1_hit=1, last_price=float(price), last_checked_at=now_str)
+                        _update_trade_status(
+                            trade_id,
+                            tp1_hit=1,
+                            sl=float(be_price),
+                            last_price=float(price),
+                            last_checked_at=now_str,
+                        )
 
                     # TP2 (финал)
                     tp2_trigger = (price >= tp2) if dir_u == "LONG" else (price <= tp2)
