@@ -302,7 +302,7 @@ async def build_auto_signal_text(
     return "\n".join(parts)
 
 
-# ---------- ВОРКЕР, КОТОРЫЙ РАЗ В N ЧАСОВ ДАЁТ СИГНАЛЫ ----------
+# ---------- ВОРКЕР, КОТОРЫЙ РАЗ В N ЧАСОВ ДАЁТ СИГНАЛЫ ---------- 
 
 async def auto_signals_worker(
     bot: Bot,
