@@ -500,14 +500,19 @@ async def fetch_trc20_transactions() -> list:
         "only_confirmed": "true",
     }
 
-    async with aiohttp.ClientSession(headers=headers) as session:
-        async with session.get(url, params=params, timeout=20) as resp:
-            if resp.status != 200:
-                text = await resp.text()
-                logger.error("TronGrid error %s: %s", resp.status, text)
-                return []
-            data = await resp.json()
-            return data.get("data", [])
+    try:
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.get(url, params=params, timeout=20) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    logger.error("TronGrid error %s: %s", resp.status, text)
+                    return []
+                data = await resp.json()
+                return data.get("data", [])
+    except Exception as e:
+        logger.exception("TronGrid request failed: %s", e)
+        return []
+
 
 
 async def find_payment_for_purchase(amount: Decimal, created_at: datetime) -> str | None:
@@ -1699,12 +1704,18 @@ async def send_profile(message: types.Message, edit: bool = False):
         f"• Полный доступ: {'есть ✅' if full_access else 'нет ❌'}",
     ]
 
-    if signals_until:
-        text_lines.append(f"• Подписка на сигналы активна до: <b>{signals_until.strftime('%Y-%m-%d')}</b>")
+    now = datetime.utcnow()
+
+    if signals_until and signals_until > now:
+        text_lines.append(f"• Подписка на сигналы активна до: <b>{signals_until.strftime('%Y-%m-%d')}</b> ✅")
         has_signals = True
-    else:
-        text_lines.append("• Подписка на сигналы: <b>не активна</b>")
+    elif signals_until:
+        text_lines.append(f"• Подписка на сигналы: <b>истекла</b> ({signals_until.strftime('%Y-%m-%d')}) ❌")
         has_signals = False
+    else:
+        text_lines.append("• Подписка на сигналы: <b>не активна</b> ❌")
+        has_signals = False
+
 
     text_lines.extend(
         [
