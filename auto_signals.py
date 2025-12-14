@@ -6,7 +6,7 @@ import logging
 import os
 import time
 from decimal import Decimal
-from typing import Optional, Sequence, List, Tuple
+from typing import Optional, Sequence, List, Tuple, Dict
 from datetime import datetime
 
 import aiohttp
@@ -32,6 +32,13 @@ COINGECKO_API_BASE = "https://pro-api.coingecko.com/api/v3" if COINGECKO_PRO_KEY
 
 # Анти-спам к CoinGecko: если получили 429 — ставим “пауза” и не долбим дальше
 COINGECKO_COOLDOWN_UNTIL = 0.0  # time.time()
+
+# Кэш market_chart, чтобы не ловить 429 при частых /test_signal и ретраях
+# TTL можно менять через переменную окружения COINGECKO_CACHE_TTL (секунды)
+COINGECKO_CACHE_TTL = int(os.getenv("COINGECKO_CACHE_TTL", "90"))
+_COINGECKO_CACHE: Dict[str, Tuple[float, List[Tuple[int, Decimal]]]] = {}
+_COINGECKO_LOCK = asyncio.Lock()       # чтобы не дергать CoinGecko параллельно
+_GENERATION_LOCK = asyncio.Lock()      # чтобы не запускать генерацию одновременно (бот + воркеры)
 
 # Маппинг наших пар на CoinGecko ID
 COINGECKO_IDS = {
@@ -79,6 +86,14 @@ async def fetch_coingecko_market_chart(coin_id: str, days: int = 3) -> Optional[
 
     global COINGECKO_COOLDOWN_UNTIL
     now_ts = time.time()
+
+    # Быстрый кэш: если уже недавно брали market_chart — используем его (даже во время cooldown)
+    cached = _COINGECKO_CACHE.get(coin_id)
+    if cached:
+        cached_ts, cached_series = cached
+        if now_ts - cached_ts <= COINGECKO_CACHE_TTL:
+            return cached_series
+
     if COINGECKO_COOLDOWN_UNTIL and now_ts < COINGECKO_COOLDOWN_UNTIL:
         # недавно получили 429 — даём CoinGecko “остыть”
         return None
@@ -89,27 +104,28 @@ async def fetch_coingecko_market_chart(coin_id: str, days: int = 3) -> Optional[
     elif COINGECKO_DEMO_KEY:
         headers["x-cg-demo-api-key"] = COINGECKO_DEMO_KEY
 
-    async with aiohttp.ClientSession(headers=headers) as session:
-        try:
-            async with session.get(url, params=params, timeout=15) as resp:
-                if resp.status == 429:
-                    # Rate limit — ставим паузу (если Retry-After нет, берём 30 сек)
-                    ra = resp.headers.get("Retry-After")
-                    try:
-                        wait_s = int(ra) if ra else 30
-                    except Exception:
-                        wait_s = 30
-                    COINGECKO_COOLDOWN_UNTIL = time.time() + max(wait_s, 10)
-                    logger.warning("CoinGecko 429 rate limit for %s, cooldown %ss", coin_id, wait_s)
-                    return None
-                if resp.status != 200:
-                    txt = await resp.text()
-                    logger.warning("CoinGecko market_chart %s status %s body=%s", coin_id, resp.status, txt[:200])
-                    return None
-                data = await resp.json()
-        except Exception as e:
-            logger.error("Error fetching CoinGecko market_chart for %s: %s", coin_id, e)
-            return None
+    async with _COINGECKO_LOCK:
+        async with aiohttp.ClientSession(headers=headers) as session:
+            try:
+                async with session.get(url, params=params, timeout=15) as resp:
+                    if resp.status == 429:
+                        # Rate limit — ставим паузу (если Retry-After нет, берём 60 сек)
+                        ra = resp.headers.get("Retry-After")
+                        try:
+                            wait_s = int(ra) if ra else 60
+                        except Exception:
+                            wait_s = 60
+                        COINGECKO_COOLDOWN_UNTIL = time.time() + max(wait_s, 10)
+                        logger.warning("CoinGecko 429 rate limit for %s, cooldown %ss", coin_id, wait_s)
+                        return None
+                    if resp.status != 200:
+                        txt = await resp.text()
+                        logger.warning("CoinGecko market_chart %s status %s body=%s", coin_id, resp.status, txt[:200])
+                        return None
+                    data = await resp.json()
+            except Exception as e:
+                logger.error("Error fetching CoinGecko market_chart for %s: %s", coin_id, e)
+                return None
 
     prices = data.get("prices")
     if not prices or len(prices) < 10:
@@ -127,9 +143,8 @@ async def fetch_coingecko_market_chart(coin_id: str, days: int = 3) -> Optional[
     if len(series) < 10:
         return None
 
+    _COINGECKO_CACHE[coin_id] = (time.time(), series)
     return series
-
-
 # ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ----------
 
 def _format_price(p: Decimal) -> str:
@@ -195,25 +210,26 @@ async def build_auto_signal_text(symbols: Sequence[str], enabled: bool) -> Optio
     if not enabled:
         return None
 
-    pairs = list(symbols) or ["BTCUSDT"]
-    random.shuffle(pairs)
+    async with _GENERATION_LOCK:
+        pairs = list(symbols) or ["BTCUSDT"]
+        random.shuffle(pairs)
 
-    # Сколько пар пробовать за один вызов (чтобы не словить 429 ещё сильнее)
-    max_tries = min(len(pairs), 8)
+        # Сколько пар пробовать за один вызов (чтобы не словить 429 ещё сильнее)
+        max_tries = min(len(pairs), 8)
 
-    for pair in pairs[:max_tries]:
-        # Если мы в cooldown после 429 — не долбим дальше
-        if COINGECKO_COOLDOWN_UNTIL and time.time() < COINGECKO_COOLDOWN_UNTIL:
-            return None
+        for pair in pairs[:max_tries]:
+            # Если мы в cooldown после 429 — не долбим дальше
+            if COINGECKO_COOLDOWN_UNTIL and time.time() < COINGECKO_COOLDOWN_UNTIL:
+                return None
 
-        text = await _build_auto_signal_text_single([pair], True)
-        if text:
-            return text
+            text = await _build_auto_signal_text_single([pair], True)
+            if text:
+                return text
 
-        # мягкая пауза между запросами
-        await asyncio.sleep(0.8)
+            # мягкая пауза между запросами
+            await asyncio.sleep(0.8)
 
-    return None
+        return None
 
 async def _build_auto_signal_text_single(
     symbols: Sequence[str],
