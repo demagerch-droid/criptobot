@@ -86,6 +86,40 @@ ANTISPAM_SECONDS = 1.2
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# PROD: уведомления админу + кулдауны на тяжёлых действиях
+# ---------------------------------------------------------------------------
+
+_admin_notify_last: Dict[str, datetime] = {}
+_cooldowns: Dict[tuple, datetime] = {}
+
+def _cooldown_remaining(user_id: int, key: str, seconds: int) -> int:
+    """Возвращает оставшиеся секунды кулдауна (0 если можно)."""
+    now = datetime.utcnow()
+    k = (int(user_id), str(key))
+    last = _cooldowns.get(k)
+    if last is None:
+        _cooldowns[k] = now
+        return 0
+    diff = (now - last).total_seconds()
+    if diff >= seconds:
+        _cooldowns[k] = now
+        return 0
+    return int(seconds - diff) + 1
+
+async def notify_admin(text: str, key: str = "generic", cooldown: int = 300) -> None:
+    """Шлём админу только иногда (чтобы не спамить)."""
+    try:
+        now = datetime.utcnow()
+        last = _admin_notify_last.get(key)
+        if last and (now - last).total_seconds() < cooldown:
+            return
+        _admin_notify_last[key] = now
+        await bot.send_message(ADMIN_ID, text, disable_web_page_preview=True)
+    except Exception:
+        # Если вдруг нельзя отправить (бот без прав/админ недоступен) — просто молчим
+        return
+
 bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
 dp = Dispatcher(bot)
 dp.middleware.setup(LoggingMiddleware())
@@ -784,6 +818,7 @@ async def tp_monitor_worker():
 
             except Exception as e:
                 logger.exception("tp_monitor_worker error: %s", e)
+                await notify_admin(f"🚨 tp_monitor_worker error: {e}", key="tp_monitor", cooldown=600)
 
             await asyncio.sleep(20)
 
@@ -827,6 +862,7 @@ async def auto_signals_worker_tracked(
                 logger.info("Auto signal skipped due to quiet hours (local hour=%s)", local_hour)
         except Exception as e:
             logger.error("Auto signals tracked worker error: %s", e)
+            await notify_admin(f"⚠️ Auto-signals worker error: {e}", key="auto_signals_worker", cooldown=600)
 
         await asyncio.sleep(interval)
 
@@ -994,11 +1030,13 @@ async def fetch_trc20_transactions() -> list:
                 if resp.status != 200:
                     text = await resp.text()
                     logger.error("TronGrid error %s: %s", resp.status, text)
+                    await notify_admin(f"⚠️ TronGrid ответил {resp.status}. Проверка оплат может временно не работать.", key="trongrid_http", cooldown=600)
                     return []
                 data = await resp.json()
                 return data.get("data", [])
     except Exception as e:
         logger.exception("TronGrid request failed: %s", e)
+        await notify_admin(f"🚨 TronGrid request failed: {e}", key="trongrid_exc", cooldown=600)
         return []
 
 
@@ -2374,6 +2412,12 @@ async def cb_check_pay(call: CallbackQuery):
         await call.answer("Некорректный ID покупки.", show_alert=True)
         return
 
+    # Кулдаун: чтобы не спамили проверкой оплаты и не ловили лимиты
+    rem = _cooldown_remaining(call.from_user.id, "check_pay", 30)
+    if rem > 0:
+        await call.answer(f"⏳ Подожди {rem} сек и попробуй ещё раз.", show_alert=False)
+        return
+
     purchase_row = get_purchase(purchase_id)
     if not purchase_row:
         await call.answer("Покупка не найдена. Напиши в поддержку.", show_alert=True)
@@ -2527,6 +2571,11 @@ async def cb_admin_export_users(call: CallbackQuery):
 async def cmd_test_signal(message: types.Message):
     # Только админ
     if not is_admin(message.from_user.id):
+        return
+
+    rem = _cooldown_remaining(message.from_user.id, "test_signal", 60)
+    if rem > 0:
+        await message.answer(f"⏳ Подожди {rem} сек и попробуй ещё раз.")
         return
 
     await message.answer("⏳ Генерирую тестовый авто-сигнал...")
@@ -2740,6 +2789,7 @@ async def signals_watcher():
 
         except Exception as e:
             logger.error("Signals watcher error: %s", e)
+            await notify_admin(f"🚨 signals_watcher error: {e}", key="signals_watcher", cooldown=600)
 
         await asyncio.sleep(3600)  # раз в час
 
@@ -2767,6 +2817,24 @@ async def fallback(message: types.Message):
 
 async def on_startup(dp: Dispatcher):
     init_db()
+
+    # Логи старта (в Railway/консоль)
+    try:
+        me = await bot.get_me()
+        logger.info("✅ Bot started: @%s (id=%s)", me.username, me.id)
+    except Exception:
+        logger.info("✅ Bot started (bot.get_me failed)")
+
+    logger.info("✅ DB: connected (path=%s)", DB_PATH)
+    logger.info("✅ Channel: %s", SIGNALS_CHANNEL_ID)
+    logger.info(
+        "✅ Workers: auto_signals=%s, signals_watcher=ON, tp_monitor=ON",
+        "ON" if AUTO_SIGNALS_ENABLED else "OFF",
+    )
+
+    # Уведомление админу (редко, чтобы не спамить на каждом рестарте)
+    await notify_admin("✅ Бот запущен и воркеры активны.", key="startup", cooldown=900)
+
     asyncio.create_task(signals_watcher())
     asyncio.create_task(tp_monitor_worker())
     asyncio.create_task(
@@ -2778,7 +2846,6 @@ async def on_startup(dp: Dispatcher):
             AUTO_SIGNALS_ENABLED,
         )
     )
-    logger.info("Bot started and DB initialized.")
 
 
 
