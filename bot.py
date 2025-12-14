@@ -60,6 +60,11 @@ AUTO_SIGNALS_ENABLED = True          # если захочешь вырубит�
 AUTO_SIGNALS_PER_DAY = 5             # примерно сколько сигналов в сутки
 AUTO_SIGNALS_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]  # пары для сигналов
 
+# Уведомления о TP/SL/BE:
+# False = пишем ТОЛЬКО в канал с сигналами (без пересылок/рассылок в личку)
+TP_UPDATES_TO_USERS = False
+
+
 # Ссылки на обучающие каналы
 TRADING_EDU_CHANNEL = "https://t.me/+RPev0hkFwjk5MmQy"
 TRAFFIC_EDU_CHANNEL = "https://t.me/+AA8Un3DxezdkNWQy"
@@ -502,6 +507,30 @@ def _update_trade_status(trade_id: int, **fields):
     conn.commit()
     conn.close()
 
+
+def _update_trade_status_where(trade_id: int, where_sql: str = "", where_params: tuple = (), **fields) -> bool:
+    """Атомарное обновление сделки с дополнительными условиями в WHERE.
+    Возвращает True, если строка реально обновилась (чтобы не было дублей уведомлений)."""
+    if not fields:
+        return False
+    cols = []
+    vals = []
+    for k, v in fields.items():
+        cols.append(f"{k} = ?")
+        vals.append(v)
+    # id — первый параметр WHERE, затем дополнительные
+    vals.append(trade_id)
+    vals.extend(list(where_params))
+
+    conn = db_connect()
+    cur = conn.cursor()
+    try:
+        cur.execute(f"UPDATE signal_trades SET {', '.join(cols)} WHERE id = ? {where_sql}", vals)
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
 def get_active_signals_tg_ids() -> List[int]:
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     conn = db_connect()
@@ -584,7 +613,7 @@ def _fmt_price(p: Decimal) -> str:
         return str(p)
 
 async def _post_trade_update(channel_message_id: int, text: str):
-    # Постим в канал ответом на исходный сигнал + рассылаем подписчикам
+    # Постим обновление ТОЛЬКО в канал (ответом на исходный сигнал)
     try:
         await bot.send_message(
             SIGNALS_CHANNEL_ID,
@@ -598,7 +627,9 @@ async def _post_trade_update(channel_message_id: int, text: str):
         except Exception:
             pass
 
-    await broadcast_to_active_signals(text)
+    # Если захочешь дублировать в личку подписчикам — включи флаг TP_UPDATES_TO_USERS
+    if TP_UPDATES_TO_USERS:
+        await broadcast_to_active_signals(text)
 
 async def tp_monitor_worker():
     """Фоновый воркер: следит за активными сигналами и сам пишет про TP/SL."""
@@ -679,26 +710,27 @@ async def tp_monitor_worker():
                             text = (
                                 f"🔒 <b>Безубыток</b> ({symbol})\n"
                                 f"Цена вернулась к входу — сделка закрыта в <b>{_fmt_pct(Decimal('0'))}%</b>\n"
-                                f"Цена: <b>{price}</b>\n"
+                                f"Цена: <b>{_fmt_price(price)}</b>\n"
                                 f"Вход (BE): <b>{_fmt_price(entry_mid)}</b>"
                             )
                         else:
                             pct = (sl - entry_mid) / entry_mid * Decimal("100") if dir_u == "LONG" else (entry_mid - sl) / entry_mid * Decimal("100")
                             text = (
                                 f"🛑 <b>Стоп-лосс сработал</b> ({symbol})\n"
-                                f"Цена: <b>{price}</b>\n"
+                                f"Цена: <b>{_fmt_price(price)}</b>\n"
                                 f"Результат от входа: <b>{_fmt_pct(pct)}%</b>"
                             )
 
-                        await _post_trade_update(int(msg_id), text)
-                        _update_trade_status(
+                        if _update_trade_status_where(
                             trade_id,
+                            "AND sl_hit = 0 AND status != 'closed'",
                             sl_hit=1,
                             status="closed",
                             closed_at=now_str,
                             last_price=float(price),
                             last_checked_at=now_str,
-                        )
+                        ):
+                            await _post_trade_update(int(msg_id), text)
                         continue
 
                     # TP1
@@ -711,19 +743,20 @@ async def tp_monitor_worker():
 
                         text = (
                             f"🎯 <b>TP1 закрыт</b> ✅ ({symbol})\n"
-                            f"Цена: <b>{price}</b>\n"
+                            f"Цена: <b>{_fmt_price(price)}</b>\n"
                             f"Профит от входа: <b>+{_fmt_pct(pct)}%</b>\n"
                             f"🔒 Стоп перенесён в <b>безубыток</b>: <b>{_fmt_price(be_price)}</b>\n"
                             f"Держим дальше до TP2 💎"
                         )
-                        await _post_trade_update(int(msg_id), text)
-                        _update_trade_status(
+                        if _update_trade_status_where(
                             trade_id,
+                            "AND tp1_hit = 0 AND status != 'closed'",
                             tp1_hit=1,
                             sl=float(be_price),
                             last_price=float(price),
                             last_checked_at=now_str,
-                        )
+                        ):
+                            await _post_trade_update(int(msg_id), text)
 
                     # TP2 (финал)
                     tp2_trigger = (price >= tp2) if dir_u == "LONG" else (price <= tp2)
@@ -731,19 +764,20 @@ async def tp_monitor_worker():
                         pct = profit_pct(tp2)
                         text = (
                             f"🏁 <b>TP2 закрыт</b> ✅ ({symbol})\n"
-                            f"Цена: <b>{price}</b>\n"
+                            f"Цена: <b>{_fmt_price(price)}</b>\n"
                             f"Профит от входа: <b>+{_fmt_pct(pct)}%</b>\n"
                             f"Сделка закрыта полностью 🎉"
                         )
-                        await _post_trade_update(int(msg_id), text)
-                        _update_trade_status(
+                        if _update_trade_status_where(
                             trade_id,
+                            "AND tp2_hit = 0 AND status != 'closed'",
                             tp2_hit=1,
                             status="closed",
                             closed_at=now_str,
                             last_price=float(price),
                             last_checked_at=now_str,
-                        )
+                        ):
+                            await _post_trade_update(int(msg_id), text)
                         continue
 
                     _update_trade_status(trade_id, last_price=float(price), last_checked_at=now_str)
