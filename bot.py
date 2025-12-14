@@ -42,7 +42,7 @@ TRONGRID_API_KEY = "b33b8d65-10c9-4f7b-99e0-ab47f3bbb60f"
 WALLET_ADDRESS = "TMVnoYkCsU3XHV28P5vMZokcWinqE3pUcK"
 
 # Стандартный контракт USDT TRC20 (можно не менять)
-USDT_CONTRACT = "TMVnoYkCsU3XHV28P5vMZokcWinqE3pUcK"
+USDT_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
 
 # ID канала с сигналами (число, например -1001234567890)
 # TODO: вставь сюда ID своего канала с сигналами
