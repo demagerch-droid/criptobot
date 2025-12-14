@@ -171,6 +171,21 @@ def init_db():
         """
     )
 
+    # Ручные заявки на подтверждение оплаты (TXID)
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS manual_pay_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            purchase_id INTEGER,
+            tg_user_id INTEGER,
+            tx_id TEXT,
+            status TEXT,          -- 'pending' / 'approved' / 'rejected'
+            created_at TEXT,
+            processed_at TEXT
+        )
+        """
+    )
+
     # Подписка на сигналы
     cur.execute(
         """
@@ -368,6 +383,75 @@ def mark_purchase_paid(purchase_id: int, tx_id: str):
     conn.commit()
     conn.close()
 
+
+def is_txid_used(txid: str) -> bool:
+    """Защита от повторного использования одного и того же TXID."""
+    if not txid:
+        return False
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM purchases WHERE tx_id = ? LIMIT 1", (txid,))
+    row = cur.fetchone()
+    conn.close()
+    return bool(row)
+
+
+def upsert_manual_pay_request(purchase_id: int, tg_user_id: int, txid: str) -> int:
+    """Создаёт или обновляет pending-заявку на ручное подтверждение оплаты."""
+    conn = db_connect()
+    cur = conn.cursor()
+    created_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+    cur.execute(
+        "SELECT id FROM manual_pay_requests WHERE purchase_id = ? AND status = 'pending' ORDER BY id DESC LIMIT 1",
+        (purchase_id,),
+    )
+    row = cur.fetchone()
+    if row:
+        req_id = int(row[0])
+        cur.execute(
+            "UPDATE manual_pay_requests SET tx_id = ?, tg_user_id = ?, created_at = ? WHERE id = ?",
+            (txid, tg_user_id, created_at, req_id),
+        )
+        conn.commit()
+        conn.close()
+        return req_id
+
+    cur.execute(
+        """
+        INSERT INTO manual_pay_requests (purchase_id, tg_user_id, tx_id, status, created_at)
+        VALUES (?, ?, ?, 'pending', ?)
+        """,
+        (purchase_id, tg_user_id, txid, created_at),
+    )
+    conn.commit()
+    req_id = int(cur.lastrowid)
+    conn.close()
+    return req_id
+
+
+def get_manual_pay_request(req_id: int):
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, purchase_id, tg_user_id, tx_id, status, created_at, processed_at FROM manual_pay_requests WHERE id = ?",
+        (req_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def set_manual_pay_request_status(req_id: int, status: str):
+    conn = db_connect()
+    cur = conn.cursor()
+    processed_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    cur.execute(
+        "UPDATE manual_pay_requests SET status = ?, processed_at = ? WHERE id = ?",
+        (status, processed_at, req_id),
+    )
+    conn.commit()
+    conn.close()
 
 def extend_signals(user_db_id: int, days: int = 30):
     conn = db_connect()
@@ -997,6 +1081,9 @@ def count_referrals(user_db_id: int):
 
 user_last_action = {}
 
+# Ручная проверка оплат (fallback): ждём TXID от пользователя после нажатия кнопки
+MANUAL_TX_WAIT: Dict[int, int] = {}  # tg_user_id -> purchase_id
+
 
 def is_spam(user_id: int) -> bool:
     now = datetime.utcnow()
@@ -1453,6 +1540,7 @@ def profile_kb(has_access: bool, has_signals: bool):
 def payment_kb(purchase_id: int, back_cb: str):
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton("✅ Проверить оплату", callback_data=f"check_pay:{purchase_id}"))
+    kb.add(InlineKeyboardButton("🆘 Подтвердить вручную (TXID)", callback_data=f"manual_pay:{purchase_id}"))
     kb.add(InlineKeyboardButton("⬅️ Назад", callback_data=back_cb))
     return kb
 
@@ -2431,15 +2519,25 @@ async def cb_check_pay(call: CallbackQuery):
         await call.answer("Эта покупка уже подтверждена ✅", show_alert=True)
         return
 
+    if not TRONGRID_API_KEY:
+        await call.message.answer(
+            "⚠️ <b>Автопроверка временно недоступна</b> (нет TronGrid API key).\n\n"
+            "Нажми кнопку <b>🆘 Подтвердить вручную (TXID)</b> и отправь хэш транзакции — я передам заявку админу.",
+            reply_markup=payment_kb(purchase_id, back_cb="home_profile"),
+        )
+        await call.answer()
+        return
+
     await call.answer("Ищу оплату в сети Tron, это может занять несколько секунд...")
 
     tx_hash = await find_payment_for_purchase(amount, created_at)
     if not tx_hash:
         await call.message.answer(
             "❌ Пока не вижу подходящий платёж.\n\n"
-            "Убедись, что отправил <b>точно</b> указанную сумму на правильный адрес и подожди 1–3 минуты.\n"
-            "Если вопрос не решится — напиши в поддержку, указав время и хэш транзакции.",
-            reply_markup=main_reply_kb(is_admin=is_admin(call.from_user.id)),
+            "Проверь: сеть <b>USDT TRC20</b>, сумма <b>точно как указано</b>, адрес правильный.\n"
+            "Иногда транзакции появляются с задержкой.\n\n"
+            "Если прошло несколько минут и не подтянулось — нажми <b>🆘 Подтвердить вручную (TXID)</b> и пришли хэш транзакции.",
+            reply_markup=payment_kb(purchase_id, back_cb="home_profile"),
         )
         return
 
@@ -2447,6 +2545,225 @@ async def cb_check_pay(call: CallbackQuery):
     mark_purchase_paid(purchase_id, tx_hash)
     await process_successful_payment(get_purchase(purchase_id))
 
+
+# ---------------------------------------------------------------------------
+# РУЧНОЕ ПОДТВЕРЖДЕНИЕ ОПЛАТЫ (FALLBACK)
+# ---------------------------------------------------------------------------
+
+@dp.callback_query_handler(lambda c: c.data.startswith("manual_pay:"))
+async def cb_manual_pay(call: CallbackQuery):
+    _, pid_str = call.data.split(":", 1)
+    try:
+        purchase_id = int(pid_str)
+    except ValueError:
+        await call.answer("Некорректный ID покупки.", show_alert=True)
+        return
+
+    purchase_row = get_purchase(purchase_id)
+    if not purchase_row:
+        await call.answer("Покупка не найдена.", show_alert=True)
+        return
+
+    p_id, user_db_id, product_code, amount_f, status, created_at_str, tx_id = purchase_row
+
+    user_row = get_user_by_tg(call.from_user.id)
+    if not user_row or user_row[0] != user_db_id:
+        await call.answer("Это не твоя покупка.", show_alert=True)
+        return
+
+    if status == "paid":
+        await call.answer("Эта покупка уже подтверждена ✅", show_alert=True)
+        return
+
+    MANUAL_TX_WAIT[call.from_user.id] = purchase_id
+    await call.message.answer(
+        "🆘 <b>Ручное подтверждение оплаты</b>\n\n"
+        "Отправь одним сообщением <b>TXID</b> (хэш транзакции) — <b>64</b> символа (0-9, a-f).\n"
+        "Если передумал — напиши <code>отмена</code>.",
+        disable_web_page_preview=True,
+    )
+    await call.answer()
+
+
+@dp.message_handler(lambda m: m.from_user and m.from_user.id in MANUAL_TX_WAIT)
+async def msg_manual_txid(message: types.Message):
+    purchase_id = MANUAL_TX_WAIT.get(message.from_user.id)
+
+    text = (message.text or "").strip()
+    if text.lower() in {"отмена", "cancel"}:
+        MANUAL_TX_WAIT.pop(message.from_user.id, None)
+        await message.answer("Ок, отменил ✅")
+        return
+
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", text):
+        await message.answer("❌ Это не похоже на TXID. Вставь ровно <b>64</b> символа (0-9, a-f).")
+        return
+
+    txid = text
+
+    purchase_row = get_purchase(int(purchase_id))
+    if not purchase_row:
+        MANUAL_TX_WAIT.pop(message.from_user.id, None)
+        await message.answer("Покупка не найдена. Напиши в поддержку.")
+        return
+
+    p_id, user_db_id, product_code, amount_f, status, created_at_str, old_tx = purchase_row
+
+    user_row = get_user_by_tg(message.from_user.id)
+    if not user_row or user_row[0] != user_db_id:
+        MANUAL_TX_WAIT.pop(message.from_user.id, None)
+        await message.answer("❌ Эта покупка не принадлежит твоему аккаунту.")
+        return
+
+    if status == "paid":
+        MANUAL_TX_WAIT.pop(message.from_user.id, None)
+        await message.answer("✅ Эта покупка уже подтверждена.")
+        return
+
+    if is_txid_used(txid):
+        await message.answer("⚠️ Этот TXID уже использован. Проверь, что отправляешь правильный хэш транзакции.")
+        return
+
+    req_id = upsert_manual_pay_request(int(purchase_id), message.from_user.id, txid)
+
+    kb = InlineKeyboardMarkup()
+    kb.row(
+        InlineKeyboardButton("✅ Подтвердить", callback_data=f"admin_mpay_ok:{req_id}"),
+        InlineKeyboardButton("❌ Отклонить", callback_data=f"admin_mpay_no:{req_id}"),
+    )
+
+    amount = Decimal(str(amount_f))
+    tronscan_link = f"https://tronscan.org/#/transaction/{txid}"
+
+    try:
+        await bot.send_message(
+            ADMIN_ID,
+            "🆘 <b>Запрос на ручное подтверждение оплаты</b>\n\n"
+            f"Заявка: <code>{req_id}</code>\n"
+            f"Покупка: <code>{purchase_id}</code>\n"
+            f"Юзер: <code>{message.from_user.id}</code>\n"
+            f"Товар: <b>{product_code}</b>\n"
+            f"Сумма: <b>{amount}</b> USDT\n"
+            f"TXID: <code>{txid}</code>\n"
+            f"TronScan: {tronscan_link}",
+            reply_markup=kb,
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        pass
+
+    MANUAL_TX_WAIT.pop(message.from_user.id, None)
+    await message.answer("✅ Заявку отправил админу. Как подтвердим — доступ откроется.")
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("admin_mpay_ok:"))
+async def cb_admin_manual_ok(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer()
+        return
+
+    _, rid_str = call.data.split(":", 1)
+    try:
+        req_id = int(rid_str)
+    except ValueError:
+        await call.answer("Некорректная заявка.", show_alert=True)
+        return
+
+    req = get_manual_pay_request(req_id)
+    if not req:
+        await call.answer("Заявка не найдена.", show_alert=True)
+        return
+
+    _id, purchase_id, tg_user_id, txid, status, created_at, processed_at = req
+
+    if status != "pending":
+        await call.answer("Уже обработано.", show_alert=True)
+        return
+
+    if is_txid_used(txid):
+        await call.answer("TXID уже использован ⚠️", show_alert=True)
+        set_manual_pay_request_status(req_id, "rejected")
+        try:
+            await call.message.edit_text("❌ Отклонено (TXID уже был использован).")
+        except Exception:
+            pass
+        return
+
+    purchase_row = get_purchase(int(purchase_id))
+    if not purchase_row:
+        await call.answer("Покупка не найдена.", show_alert=True)
+        set_manual_pay_request_status(req_id, "rejected")
+        try:
+            await call.message.edit_text("❌ Отклонено (покупка не найдена).")
+        except Exception:
+            pass
+        return
+
+    p_id, user_db_id, product_code, amount_f, p_status, created_at_str, old_tx = purchase_row
+    if p_status == "paid":
+        set_manual_pay_request_status(req_id, "approved")
+        await call.answer("Покупка уже подтверждена ✅", show_alert=True)
+        try:
+            await call.message.edit_text("✅ Подтверждено (покупка уже была оплачена).")
+        except Exception:
+            pass
+        return
+
+    mark_purchase_paid(int(purchase_id), str(txid))
+    set_manual_pay_request_status(req_id, "approved")
+    await process_successful_payment(get_purchase(int(purchase_id)))
+
+    try:
+        await call.message.edit_text("✅ Подтверждено и обработано.")
+    except Exception:
+        pass
+
+    await call.answer("Готово ✅", show_alert=False)
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("admin_mpay_no:"))
+async def cb_admin_manual_no(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer()
+        return
+
+    _, rid_str = call.data.split(":", 1)
+    try:
+        req_id = int(rid_str)
+    except ValueError:
+        await call.answer("Некорректная заявка.", show_alert=True)
+        return
+
+    req = get_manual_pay_request(req_id)
+    if not req:
+        await call.answer("Заявка не найдена.", show_alert=True)
+        return
+
+    _id, purchase_id, tg_user_id, txid, status, created_at, processed_at = req
+
+    if status != "pending":
+        await call.answer("Уже обработано.", show_alert=True)
+        return
+
+    set_manual_pay_request_status(req_id, "rejected")
+
+    try:
+        await bot.send_message(
+            int(tg_user_id),
+            "❌ Оплата не подтверждена админом.\n\n"
+            "Проверь, что TXID верный и транзакция действительно USDT (TRC20). "
+            "Если нужна помощь — напиши в поддержку.",
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        pass
+
+    try:
+        await call.message.edit_text("❌ Отклонено.")
+    except Exception:
+        pass
+
+    await call.answer("Отклонено", show_alert=False)
 
 # ---------------------------------------------------------------------------
 # АДМИН-КОМАНДЫ (МИНИМАЛЬНЫЙ НАБОР)
