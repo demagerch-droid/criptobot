@@ -1,1005 +1,1409 @@
-# ===================== CONFIG (ВСТАВЬ СВОЁ) =====================
-BOT_TOKEN = "8491759417:AAFCnK5ubsubVQPYvdOTp6p0MRJrtA4m5p8"
-ADMIN_ID = 8585550939  # твой Telegram ID (числом)
-
-PRICE_USD = 200.0
-SUPPORT_USERNAME = "@Traffic_Partner_Bot"         # куда писать по оплате
-PRIVATE_GROUP_LINK = "https://t.me/your_private_group"  # ссылка на закрытую группу/чат
-
-REF_L1 = 0.50
-REF_L2 = 0.10
-MIN_PAYOUT = 10.0
-# ================================================================
-
-import os
-import asyncio
-import logging
-from datetime import datetime, timezone
-from typing import Optional, Dict, List, Tuple
-
-import aiosqlite
-from aiogram import Bot, Dispatcher, Router, F
-from aiogram.client.default import DefaultBotProperties
-from contextlib import asynccontextmanager
-from aiogram.enums import ParseMode
-from aiogram.filters import CommandStart, Command
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("traffic_edu_bot")
-
-if not BOT_TOKEN or "PASTE" in BOT_TOKEN:
-    raise RuntimeError("Вставь реальный BOT_TOKEN в начале файла (строкой в кавычках).")
-
-def is_admin(user_id: int) -> bool:
-    return user_id == ADMIN_ID
-
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-# ---- DB PATH (Railway volume recommended) ----
-DEFAULT_DB = "/data/database.db"
-DB_PATH = DEFAULT_DB
-try:
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-except Exception:
-    DB_PATH = "database.db"
-
-SCHEMA = """
-PRAGMA journal_mode=WAL;
-
-CREATE TABLE IF NOT EXISTS users(
-  user_id INTEGER PRIMARY KEY,
-  username TEXT,
-  first_name TEXT,
-  ref1 INTEGER,
-  ref2 INTEGER,
-  source TEXT,
-  access INTEGER DEFAULT 0,
-  created_at TEXT
-);
-
-CREATE TABLE IF NOT EXISTS payments(
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER,
-  amount REAL,
-  status TEXT,          -- pending/approved/rejected
-  created_at TEXT,
-  decided_at TEXT
-);
-
-CREATE TABLE IF NOT EXISTS wallets(
-  user_id INTEGER PRIMARY KEY,
-  balance REAL DEFAULT 0,
-  total_earned REAL DEFAULT 0
-);
-
-CREATE TABLE IF NOT EXISTS ref_earnings(
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  payment_id INTEGER,
-  from_user_id INTEGER,
-  to_user_id INTEGER,
-  level INTEGER,
-  amount REAL,
-  created_at TEXT,
-  UNIQUE(payment_id, level, to_user_id)
-);
-
-CREATE TABLE IF NOT EXISTS progress(
-  user_id INTEGER,
-  module_id INTEGER,
-  lesson_id INTEGER,
-  done INTEGER DEFAULT 0,
-  updated_at TEXT,
-  PRIMARY KEY(user_id, module_id, lesson_id)
-);
-
-CREATE TABLE IF NOT EXISTS payouts(
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER,
-  amount REAL,
-  details TEXT,
-  status TEXT,          -- pending/approved/rejected
-  created_at TEXT,
-  decided_at TEXT
-);
-
-CREATE INDEX IF NOT EXISTS idx_users_ref1 ON users(ref1);
-CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status);
-CREATE INDEX IF NOT EXISTS idx_payouts_status ON payouts(status);
+# -*- coding: utf-8 -*-
+"""
+Traffic Partner Bot (УБД/перелив трафика) — AIogram 3 + aiosqlite
+Логика:
+- Постоянное нижнее меню (ReplyKeyboard): 🧠 Обучение / 💸 Заработок / 👤 Профиль
+- Оплата полного доступа (USDT TRC20) через TronGrid с "хвостиком" суммы
+- Доступ "навсегда" (без подписки)
+- 8 модулей обучения: структура видна всем, но модули "закрыты" до оплаты
+- Партнёрка 2 уровня: 50% (1 линия) + 10% (2 линия) от базовой цены (без хвостика)
+- Админ-панель доступна только ADMIN_ID
 """
 
-async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.executescript(SCHEMA)
-        await db.commit()
+import asyncio
+import logging
+import random
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from decimal import Decimal, ROUND_DOWN
+
+import aiohttp
+import aiosqlite
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.enums import ParseMode
+from aiogram.filters import CommandStart, Command
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
+
+# ---------------------------------------------------------------------------
+# НАСТРОЙКИ (всё в коде — как ты просил)
+# ---------------------------------------------------------------------------
+
+BOT_TOKEN = "8491759417:AAFCnK5ubsubVQPYvdOTp6p0MRJrtA4m5p8"  # ⚠️ лучше вставить новый токен (перевыпусти в BotFather)
+ADMIN_ID = 8585550939  # твой TG ID (числом)
+
+# TronGrid / TRC20 (USDT)
+TRONGRID_API_KEY = "PASTE_TRONGRID_KEY_HERE"
+WALLET_ADDRESS = "PASTE_YOUR_TRON_WALLET_HERE"  # адрес получателя USDT TRC20 (T...)
+USDT_TRON_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"  # стандартный контракт USDT TRC20
+
+# Цена доступа
+PRICE_ACCESS = Decimal("200")  # $200
+LEVEL1_PERCENT = Decimal("0.50")  # 50%
+LEVEL2_PERCENT = Decimal("0.10")  # 10%
+
+# Куда вести после оплаты
+PRIVATE_CHANNEL_URL = "https://t.me/your_private_channel_or_invite_link"
+COMMUNITY_GROUP_URL = "https://t.me/your_group_or_forum_link"
+SUPPORT_CONTACT = "@your_support_username"
+
+DB_PATH = "database.db"
+
+# Антиспам (сек)
+ANTISPAM_SECONDS = 1.2
+
+# ---------------------------------------------------------------------------
+# ОФОРМЛЕНИЕ / ТЕКСТЫ / МОДУЛИ
+# ---------------------------------------------------------------------------
+
+PROJECT_NAME = "Traffic Partner Bot"
+ACCESS_NAME = "Полный доступ"
+
+MODULES = [
+    "1️⃣ Модуль 1 — Старт: система перелива (УБД) и воронка",
+    "2️⃣ Модуль 2 — TikTok / Reels: как добывать трафик стабильно",
+    "3️⃣ Модуль 3 — Прогрев без канала: сценарии и структура контента",
+    "4️⃣ Модуль 4 — Связка «ролик → бот → покупка»",
+    "5️⃣ Модуль 5 — Аналитика, трекинг, метрики, оптимизация",
+    "6️⃣ Модуль 6 — Мультиаккаунты, антидетект, прокси, безопасность",
+    "7️⃣ Модуль 7 — Масштабирование и команда (делегирование)",
+    "8️⃣ Модуль 8 — Партнёрка: как строить сеть и удержание",
+]
+
+# Контент модулей — ты потом заменишь текст внутри
+MODULE_TEXT_PLACEHOLDER = (
+    "📝 <b>Здесь будет текст модуля</b>\n\n"
+    "Ты можешь вставить сюда свой контент, чек-листы, ссылки, примеры связок и т.д.\n"
+    "Чтобы было красиво — делай:\n"
+    "• короткие блоки\n"
+    "• списки\n"
+    "• выделение жирным\n\n"
+    "Если хочешь — я помогу красиво оформить каждый модуль."
+)
+
+# ---------------------------------------------------------------------------
+# ЛОГИ
+# ---------------------------------------------------------------------------
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("traffic_bot")
+
+# ---------------------------------------------------------------------------
+# DB
+# ---------------------------------------------------------------------------
 
 @asynccontextmanager
-async def db_connect():
-    # Важно: НЕ делаем "async with await aiosqlite.connect()"
-    # Используем контекст-менеджер, чтобы aiosqlite не пытался стартовать поток дважды.
+async def get_db():
     db = await aiosqlite.connect(DB_PATH, timeout=30)
     db.row_factory = aiosqlite.Row
+    await db.execute("PRAGMA journal_mode=WAL;")
+    await db.execute("PRAGMA foreign_keys=ON;")
     await db.execute("PRAGMA busy_timeout=30000;")
     try:
         yield db
     finally:
         await db.close()
 
-# ---------- Anti-copy helper ----------
 
-# Telegram НЕ даёт 100% запретить копирование текста, но:
-# 1) protect_content=True запрещает пересылку/сохранение
-# 2) невидимый символ U+2060 (WORD JOINER) портит копипаст
-def obfuscate_for_copy(text: str) -> str:
-    joiner = "\u2060"
-    out = []
-    for ch in text:
-        if ch.isalnum():
-            out.append(ch + joiner)
-        else:
-            out.append(ch)
-    return "".join(out)
-
-# ---------- Course content ----------
-# Поменяешь тексты как захочешь — структура уже готова.
-COURSE: Dict[int, Dict[str, object]] = {
-    1: {
-        "title": "TikTok база и аккаунты",
-        "lessons": [
-            (1, "Старт: что такое арбитраж и УБД", "Коротко: арбитраж — это покупка/привлечение трафика и монетизация через офферы.\n\nУБД — модель, где ты даёшь ценность (прогрев/пруфы/кейсы), а потом переводишь в действие (покупка/регистрация/заявка)."),
-            (2, "Оформление профиля TikTok под воронку", "Аватар, ник, био, закрепы.\n\nЦель: чтобы за 3 секунды человек понял: кто ты, что даёшь, куда жать дальше."),
-            (3, "Аккаунты: прогрев и безопасность", "Не лезь в серые темы с первого дня.\n\nРазгон: контент → активность → плавно CTA.\n\nБазовая безопасность: устройство/симка/поведение."),
-        ],
-    },
-    2: {
-        "title": "Контент и креативы",
-        "lessons": [
-            (1, "Формула креатива на 15 секунд", "Хук (1-2 сек) → проблема → решение → CTA.\n\nСнимай сериями: 20-30 роликов, потом оставляй лучшие."),
-            (2, "Идеи хуков, которые реально заходят", "«Я слил 300$ за неделю и понял одну вещь…»\n«Если бы я начинал с нуля — сделал бы так…»\n«3 ошибки, из-за которых ты не льёшь в плюс»"),
-            (3, "Тестирование: как понять что держать", "Смотри удержание, досмотры, переходы.\n\nНе женись на одном креативе — тесты решают."),
-        ],
-    },
-    3: {
-        "title": "Перелив в Telegram и прогрев",
-        "lessons": [
-            (1, "Перелив в бота (твоя схема)", "Трафик льём сразу в бота.\n\nЭто хорошо, потому что бот = мини-лендинг + выдача доступа + партнёрка.\n\nКанал ты ведёшь сам (для своих)."),
-            (2, "Прогрев внутри бота", "В боте должны быть: выгоды, структура, кейсы/пруфы, FAQ, гарантийные формулировки.\n\nИ один CTA: купить доступ / написать админу."),
-            (3, "Как закрывать на оплату", "Снимаешь страх: что внутри, кому подходит, что получит, как быстро применить.\n\nЧёткая цена и понятный шаг оплаты."),
-        ],
-    },
-    4: {
-        "title": "Масштабирование и система",
-        "lessons": [
-            (1, "Система: таблица учёта и дисциплина", "Без учёта ты не масштабируешься.\n\nФиксируй: креатив → дата → метрики → выводы → следующая итерация."),
-            (2, "Команда и делегирование", "Сценарии/монтаж/постинг можно делегировать.\n\nТвоя задача: связки + тесты + аналитика."),
-            (3, "Финал: доступ в закрытую группу", "В группе будут ветки по модулям, чат, отзывы и обновления.\n\nЖми кнопку ниже и заходи."),
-        ],
-    },
-}
-
-# ---------- Keyboards ----------
-def kb_main(access: bool, admin: bool) -> InlineKeyboardMarkup:
-    rows = []
-    if access:
-        rows.append([InlineKeyboardButton(text="📚 Обучение", callback_data="learn")])
-        rows.append([InlineKeyboardButton(text="👤 Профиль", callback_data="profile")])
-        rows.append([InlineKeyboardButton(text="🎁 Партнёрка", callback_data="partner")])
-    else:
-        rows.append([InlineKeyboardButton(text="🔥 Что внутри", callback_data="about")])
-        rows.append([InlineKeyboardButton(text="💳 Купить доступ ($200)", callback_data="buy")])
-        rows.append([InlineKeyboardButton(text="🎁 Партнёрка", callback_data="partner")])
-
-    rows.append([InlineKeyboardButton(text="🆘 Поддержка", url=f"https://t.me/{SUPPORT_USERNAME.lstrip('@')}")])
-
-    if admin:
-        rows.append([InlineKeyboardButton(text="🛠 Админ панель", callback_data="admin")])
-
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-def kb_back(to: str = "menu") -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data=to)],
-    ])
-
-def kb_buy() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Я оплатил", callback_data="paid")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu")],
-    ])
-
-def kb_admin() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💳 Pending оплаты", callback_data="adm:payments")],
-        [InlineKeyboardButton(text="💸 Pending выводы", callback_data="adm:payouts")],
-        [InlineKeyboardButton(text="👥 Пользователи", callback_data="adm:users")],
-        [InlineKeyboardButton(text="🎟 Выдать доступ", callback_data="adm:grant")],
-        [InlineKeyboardButton(text="⛔ Отозвать доступ", callback_data="adm:revoke")],
-        [InlineKeyboardButton(text="📣 Рассылка", callback_data="adm:broadcast")],
-        [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu")],
-    ])
-
-def kb_modules() -> InlineKeyboardMarkup:
-    rows = []
-    for mid in sorted(COURSE.keys()):
-        rows.append([InlineKeyboardButton(text=f"📦 Модуль {mid}: {COURSE[mid]['title']}", callback_data=f"mod:{mid}")])
-    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="menu")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-def kb_lessons(module_id: int) -> InlineKeyboardMarkup:
-    rows = []
-    lessons: List[Tuple[int, str, str]] = COURSE[module_id]["lessons"]  # type: ignore
-    for lid, title, _ in lessons:
-        rows.append([InlineKeyboardButton(text=f"Урок {lid}: {title}", callback_data=f"lesson:{module_id}:{lid}")])
-    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="learn")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-def kb_lesson_nav(module_id: int, lesson_id: int) -> InlineKeyboardMarkup:
-    lessons: List[Tuple[int, str, str]] = COURSE[module_id]["lessons"]  # type: ignore
-    ids = [lid for (lid, _, _) in lessons]
-    i = ids.index(lesson_id)
-    prev_id = ids[i - 1] if i > 0 else None
-    next_id = ids[i + 1] if i < len(ids) - 1 else None
-
-    rows = []
-    nav = []
-    if prev_id is not None:
-        nav.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"lesson:{module_id}:{prev_id}"))
-    if next_id is not None:
-        nav.append(InlineKeyboardButton(text="➡️ Далее", callback_data=f"lesson:{module_id}:{next_id}"))
-    if nav:
-        rows.append(nav)
-
-    rows.append([InlineKeyboardButton(text="✅ Отметить пройдено", callback_data=f"done:{module_id}:{lesson_id}")])
-
-    if module_id == 4 and lesson_id == 3:
-        rows.append([InlineKeyboardButton(text="🚀 В закрытую группу", url=PRIVATE_GROUP_LINK)])
-
-    rows.append([InlineKeyboardButton(text="⬅️ К урокам", callback_data=f"mod:{module_id}")])
-    rows.append([InlineKeyboardButton(text="🏠 Меню", callback_data="menu")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-def kb_partner() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💸 Запросить вывод", callback_data="payout")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu")],
-    ])
-
-# ---------- DB helpers ----------
-async def upsert_user(user_id: int, username: str, first_name: str, source: str, ref_id: Optional[int]):
-    async with db_connect() as db:
-        row = await (await db.execute("SELECT user_id, ref1, ref2 FROM users WHERE user_id=?", (user_id,))).fetchone()
-        if row:
-            # обновим username/first_name при необходимости
-            await db.execute("UPDATE users SET username=?, first_name=? WHERE user_id=?", (username, first_name, user_id))
-            await db.commit()
-            return
-
-        ref1 = None
-        ref2 = None
-        if ref_id and ref_id != user_id:
-            # ref1 = ref_id, ref2 = ref1(ref_id)
-            r = await (await db.execute("SELECT ref1 FROM users WHERE user_id=?", (ref_id,))).fetchone()
-            ref1 = ref_id
-            ref2 = int(r["ref1"]) if r and r["ref1"] else None
-
+async def init_db():
+    async with get_db() as db:
         await db.execute(
-            "INSERT INTO users(user_id, username, first_name, ref1, ref2, source, access, created_at) VALUES (?,?,?,?,?,?,?,?)",
-            (user_id, username, first_name, ref1, ref2, source, 0, now_iso())
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tg_id INTEGER UNIQUE NOT NULL,
+                username TEXT DEFAULT '',
+                first_name TEXT DEFAULT '',
+                referrer_id INTEGER,
+                reg_date TEXT,
+                full_access INTEGER DEFAULT 0,
+                balance TEXT DEFAULT '0',
+                total_earned TEXT DEFAULT '0',
+                is_blocked INTEGER DEFAULT 0,
+                FOREIGN KEY(referrer_id) REFERENCES users(id)
+            );
+            """
         )
-        await db.execute("INSERT OR IGNORE INTO wallets(user_id, balance, total_earned) VALUES (?,0,0)", (user_id,))
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS purchases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                product_code TEXT NOT NULL,         -- "access"
+                amount TEXT NOT NULL,               -- Decimal as string (важно!)
+                status TEXT NOT NULL,               -- "pending" / "paid"
+                created_at TEXT NOT NULL,
+                paid_at TEXT,
+                tx_id TEXT,
+                UNIQUE(tx_id),
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            );
+            """
+        )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS progress (
+                user_id INTEGER PRIMARY KEY,
+                module_index INTEGER DEFAULT -1,
+                updated_at TEXT,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            );
+            """
+        )
         await db.commit()
 
-async def get_access(user_id: int) -> bool:
-    async with db_connect() as db:
-        row = await (await db.execute("SELECT access FROM users WHERE user_id=?", (user_id,))).fetchone()
-        return bool(row and row["access"] == 1)
 
-async def set_access(user_id: int, value: bool):
-    async with db_connect() as db:
-        await db.execute("UPDATE users SET access=? WHERE user_id=?", (1 if value else 0, user_id))
+async def get_user_by_tg(tg_id: int):
+    async with get_db() as db:
+        cur = await db.execute(
+            """
+            SELECT id, tg_id, username, first_name, referrer_id, reg_date, full_access, balance, total_earned
+            FROM users WHERE tg_id = ?
+            """,
+            (tg_id,),
+        )
+        return await cur.fetchone()
+
+
+async def create_user(tg_id: int, username: str, first_name: str, referrer_id: int | None):
+    reg_date = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    async with get_db() as db:
+        await db.execute(
+            """
+            INSERT INTO users (tg_id, username, first_name, referrer_id, reg_date)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (tg_id, username or "", first_name or "", referrer_id, reg_date),
+        )
+        await db.commit()
+        cur = await db.execute("SELECT id FROM users WHERE tg_id = ?", (tg_id,))
+        row = await cur.fetchone()
+        return row["id"]
+
+
+async def update_user_profile(tg_id: int, username: str, first_name: str):
+    async with get_db() as db:
+        await db.execute(
+            "UPDATE users SET username = ?, first_name = ? WHERE tg_id = ?",
+            (username or "", first_name or "", tg_id),
+        )
         await db.commit()
 
-async def get_stats(user_id: int) -> Tuple[float, int, int, int]:
-    async with db_connect() as db:
-        w = await (await db.execute("SELECT balance, total_earned FROM wallets WHERE user_id=?", (user_id,))).fetchone()
-        balance = float(w["balance"]) if w else 0.0
-        total = float(w["total_earned"]) if w else 0.0
 
-        c1 = await (await db.execute("SELECT COUNT(*) AS c FROM users WHERE ref1=?", (user_id,))).fetchone()
-        invited1 = int(c1["c"]) if c1 else 0
+async def get_or_create_user(tg_user, referrer_tg_id: int | None):
+    existing = await get_user_by_tg(tg_user.id)
+    if existing:
+        await update_user_profile(tg_user.id, tg_user.username or "", tg_user.first_name or "")
+        return existing["id"]
 
-        done = await (await db.execute("SELECT COUNT(*) AS c FROM progress WHERE user_id=? AND done=1", (user_id,))).fetchone()
-        done_cnt = int(done["c"]) if done else 0
+    referrer_id = None
+    if referrer_tg_id and referrer_tg_id != tg_user.id:
+        ref_row = await get_user_by_tg(referrer_tg_id)
+        if ref_row:
+            referrer_id = ref_row["id"]
 
-    total_lessons = sum(len(COURSE[mid]["lessons"]) for mid in COURSE)  # type: ignore
-    return balance, invited1, done_cnt, total_lessons
+    return await create_user(
+        tg_id=tg_user.id,
+        username=tg_user.username or "",
+        first_name=tg_user.first_name or "",
+        referrer_id=referrer_id,
+    )
 
-async def create_payment_request(user_id: int) -> Optional[int]:
-    if await get_access(user_id):
+
+async def set_full_access(user_db_id: int, value: bool = True):
+    async with get_db() as db:
+        await db.execute("UPDATE users SET full_access = ? WHERE id = ?", (1 if value else 0, user_db_id))
+        await db.commit()
+
+
+async def has_access_by_tg(tg_id: int) -> bool:
+    row = await get_user_by_tg(tg_id)
+    return bool(row and row["full_access"])
+
+
+async def get_referrer_chain(user_db_id: int):
+    async with get_db() as db:
+        cur = await db.execute("SELECT referrer_id FROM users WHERE id = ?", (user_db_id,))
+        r1 = await cur.fetchone()
+        lvl1 = r1["referrer_id"] if r1 and r1["referrer_id"] else None
+
+        lvl2 = None
+        if lvl1:
+            cur2 = await db.execute("SELECT referrer_id FROM users WHERE id = ?", (lvl1,))
+            r2 = await cur2.fetchone()
+            lvl2 = r2["referrer_id"] if r2 and r2["referrer_id"] else None
+
+        return lvl1, lvl2
+
+
+async def add_balance(user_db_id: int, amount: Decimal):
+    async with get_db() as db:
+        cur = await db.execute("SELECT balance, total_earned FROM users WHERE id = ?", (user_db_id,))
+        row = await cur.fetchone()
+        bal = Decimal(row["balance"])
+        tot = Decimal(row["total_earned"])
+        bal += amount
+        tot += amount
+        await db.execute(
+            "UPDATE users SET balance = ?, total_earned = ? WHERE id = ?",
+            (str(bal.quantize(Decimal("0.01"))), str(tot.quantize(Decimal("0.01"))), user_db_id),
+        )
+        await db.commit()
+
+
+async def count_referrals(user_db_id: int):
+    async with get_db() as db:
+        cur1 = await db.execute("SELECT COUNT(*) AS c FROM users WHERE referrer_id = ?", (user_db_id,))
+        lvl1 = (await cur1.fetchone())["c"]
+
+        cur2 = await db.execute(
+            """
+            SELECT COUNT(*) AS c FROM users
+            WHERE referrer_id IN (SELECT id FROM users WHERE referrer_id = ?)
+            """,
+            (user_db_id,),
+        )
+        lvl2 = (await cur2.fetchone())["c"]
+
+        return int(lvl1), int(lvl2)
+
+
+async def top_referrers(limit: int = 10):
+    async with get_db() as db:
+        cur = await db.execute(
+            """
+            SELECT u.username, u.first_name, COUNT(r.id) AS cnt
+            FROM users u
+            LEFT JOIN users r ON r.referrer_id = u.id
+            GROUP BY u.id
+            HAVING cnt > 0
+            ORDER BY cnt DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        return await cur.fetchall()
+
+
+async def save_progress(user_db_id: int, module_index: int):
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    async with get_db() as db:
+        await db.execute(
+            """
+            INSERT INTO progress (user_id, module_index, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET module_index = excluded.module_index, updated_at = excluded.updated_at
+            """,
+            (user_db_id, module_index, now),
+        )
+        await db.commit()
+
+
+async def get_progress(user_db_id: int) -> int:
+    async with get_db() as db:
+        cur = await db.execute("SELECT module_index FROM progress WHERE user_id = ?", (user_db_id,))
+        row = await cur.fetchone()
+        return int(row["module_index"]) if row else -1
+
+
+# ---------------------------------------------------------------------------
+# PURCHASES / PAYMENTS
+# ---------------------------------------------------------------------------
+
+def _make_unique_amount(base: Decimal) -> Decimal:
+    tail = Decimal(random.randint(1, 999)) / Decimal("1000")  # 0.001 ... 0.999
+    return (base + tail).quantize(Decimal("0.000"), rounding=ROUND_DOWN)
+
+
+async def create_purchase(user_db_id: int, product_code: str, base_price: Decimal) -> int:
+    amount = _make_unique_amount(base_price)
+    created_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    async with get_db() as db:
+        await db.execute(
+            """
+            INSERT INTO purchases (user_id, product_code, amount, status, created_at)
+            VALUES (?, ?, ?, 'pending', ?)
+            """,
+            (user_db_id, product_code, str(amount), created_at),
+        )
+        await db.commit()
+        cur = await db.execute("SELECT last_insert_rowid() AS id")
+        row = await cur.fetchone()
+        return int(row["id"])
+
+
+async def get_purchase(purchase_id: int):
+    async with get_db() as db:
+        cur = await db.execute(
+            """
+            SELECT id, user_id, product_code, amount, status, created_at, paid_at, tx_id
+            FROM purchases WHERE id = ?
+            """,
+            (purchase_id,),
+        )
+        return await cur.fetchone()
+
+
+async def mark_purchase_paid(purchase_id: int, tx_id: str):
+    paid_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    async with get_db() as db:
+        await db.execute(
+            """
+            UPDATE purchases SET status='paid', paid_at=?, tx_id=? WHERE id=?
+            """,
+            (paid_at, tx_id, purchase_id),
+        )
+        await db.commit()
+
+
+async def get_tg_id_by_user_db(user_db_id: int) -> int | None:
+    async with get_db() as db:
+        cur = await db.execute("SELECT tg_id FROM users WHERE id = ?", (user_db_id,))
+        row = await cur.fetchone()
+        return int(row["tg_id"]) if row else None
+
+
+async def process_successful_payment(bot: Bot, purchase_row):
+    """
+    Начисляет доступ и партнёрку (50% + 10%) с базовой цены (без хвоста).
+    """
+    purchase_id = int(purchase_row["id"])
+    user_db_id = int(purchase_row["user_id"])
+    product_code = purchase_row["product_code"]
+
+    if product_code != "access":
+        return
+
+    # 1) открыть доступ
+    await set_full_access(user_db_id, True)
+
+    # 2) партнёрка
+    lvl1, lvl2 = await get_referrer_chain(user_db_id)
+    base = PRICE_ACCESS
+
+    lvl1_bonus = (base * LEVEL1_PERCENT).quantize(Decimal("0.01"))
+    lvl2_bonus = (base * LEVEL2_PERCENT).quantize(Decimal("0.01"))
+
+    if lvl1:
+        await add_balance(lvl1, lvl1_bonus)
+        tg_id_1 = await get_tg_id_by_user_db(lvl1)
+        if tg_id_1:
+            try:
+                await bot.send_message(
+                    tg_id_1,
+                    f"💰 <b>Начисление партнёрки</b>\n\n"
+                    f"Твой партнёр оплатил доступ.\n"
+                    f"Тебе начислено: <b>{lvl1_bonus}$</b> (1 уровень).",
+                    reply_markup=main_kb(),
+                )
+            except Exception:
+                pass
+
+    if lvl2:
+        await add_balance(lvl2, lvl2_bonus)
+        tg_id_2 = await get_tg_id_by_user_db(lvl2)
+        if tg_id_2:
+            try:
+                await bot.send_message(
+                    tg_id_2,
+                    f"💸 <b>Начисление партнёрки</b>\n\n"
+                    f"Покупка прошла во 2-й линии.\n"
+                    f"Тебе начислено: <b>{lvl2_bonus}$</b> (2 уровень).",
+                    reply_markup=main_kb(),
+                )
+            except Exception:
+                pass
+
+    # 3) уведомить покупателя
+    buyer_tg_id = await get_tg_id_by_user_db(user_db_id)
+    if buyer_tg_id:
+        await bot.send_message(
+            buyer_tg_id,
+            "✅ <b>Оплата подтверждена!</b>\n\n"
+            f"Доступ открыт <b>навсегда</b>.\n\n"
+            "Теперь тебе доступны:\n"
+            "• все 8 модулей обучения\n"
+            "• партнёрская программа 50% + 10%\n"
+            "• реферальная ссылка и статистика\n\n"
+            "Жми <b>«Обучение»</b> снизу — и начинай 🔥",
+            reply_markup=main_kb(),
+        )
+
+
+async def fetch_trc20_transactions() -> list:
+    """
+    TronGrid: последние TRC20 транзакции по нашему кошельку
+    """
+    url = f"https://api.trongrid.io/v1/accounts/{WALLET_ADDRESS}/transactions/trc20"
+    headers = {"TRON-PRO-API-KEY": TRONGRID_API_KEY} if TRONGRID_API_KEY else {}
+    params = {
+        "limit": 50,
+        "contract_address": USDT_TRON_CONTRACT,
+        "only_confirmed": "true",
+    }
+
+    async with aiohttp.ClientSession(headers=headers) as session:
+        async with session.get(url, params=params, timeout=25) as resp:
+            if resp.status != 200:
+                logger.error("TronGrid error: %s %s", resp.status, await resp.text())
+                return []
+            data = await resp.json()
+            return data.get("data", [])
+
+
+async def find_payment_for_amount(amount: Decimal, created_at: datetime) -> str | None:
+    """
+    Ищем транзакцию по точной сумме (с хвостом) и по времени создания заявки.
+    """
+    txs = await fetch_trc20_transactions()
+    if not txs:
         return None
-    async with db_connect() as db:
-        pending = await (await db.execute("SELECT id FROM payments WHERE user_id=? AND status='pending' ORDER BY id DESC LIMIT 1", (user_id,))).fetchone()
-        if pending:
-            return None
-        cur = await db.execute(
-            "INSERT INTO payments(user_id, amount, status, created_at, decided_at) VALUES (?,?,?,?,?)",
-            (user_id, float(PRICE_USD), "pending", now_iso(), None)
+
+    for tx in txs:
+        try:
+            to_addr = tx.get("to")
+            if to_addr != WALLET_ADDRESS:
+                continue
+
+            token_info = tx.get("token_info") or {}
+            decimals = int(token_info.get("decimals", 6))
+
+            raw_value = Decimal(tx.get("value", "0"))
+            value = raw_value / (Decimal(10) ** decimals)
+
+            # допускаем минимальную погрешность
+            if abs(value - amount) > Decimal("0.0005"):
+                continue
+
+            ts_ms = tx.get("block_timestamp")
+            tx_time = datetime.utcfromtimestamp(ts_ms / 1000.0)
+
+            # транзакция не должна быть сильно раньше заявки (например, старше 24 часов)
+            if tx_time + timedelta(hours=24) < created_at:
+                continue
+
+            tx_id = tx.get("transaction_id")
+            return tx_id
+        except Exception:
+            continue
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# UI: клавиатуры
+# ---------------------------------------------------------------------------
+
+def main_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [
+                KeyboardButton(text="🧠 Обучение"),
+                KeyboardButton(text="💸 Заработок"),
+                KeyboardButton(text="👤 Профиль"),
+            ]
+        ],
+        resize_keyboard=True,
+        input_field_placeholder="Выбери раздел снизу 👇",
+    )
+
+
+def kb_back(cb: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data=cb)]])
+
+
+def kb_buy(back_cb: str) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"💳 Купить доступ ({PRICE_ACCESS}$)", callback_data="buy_access")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data=back_cb)],
+        ]
+    )
+    return kb
+
+
+def kb_training(has_access: bool) -> InlineKeyboardMarkup:
+    rows = []
+    for idx, title in enumerate(MODULES):
+        if has_access:
+            rows.append([InlineKeyboardButton(text=title, callback_data=f"mod:{idx}")])
+        else:
+            # структура видна, но модуль закрыт
+            rows.append([InlineKeyboardButton(text=f"🔒 {title}", callback_data=f"locked:{idx}")])
+
+    bottom = []
+    if has_access:
+        bottom.append([InlineKeyboardButton(text="🔗 Перейти в закрытый канал", url=PRIVATE_CHANNEL_URL)])
+        bottom.append([InlineKeyboardButton(text="💬 Перейти в группу (чат/форум)", url=COMMUNITY_GROUP_URL)])
+    else:
+        bottom.append([InlineKeyboardButton(text=f"💳 Купить доступ ({PRICE_ACCESS}$)", callback_data="buy_access")])
+
+    rows.extend(bottom)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def kb_earn(has_access: bool) -> InlineKeyboardMarkup:
+    if not has_access:
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="📌 Как работает партнёрка", callback_data="earn_info")],
+                [InlineKeyboardButton(text=f"💳 Открыть доступ ({PRICE_ACCESS}$)", callback_data="buy_access")],
+            ]
         )
-        await db.commit()
-        return int(cur.lastrowid)
 
-async def get_payment(payment_id: int):
-    async with db_connect() as db:
-        return await (await db.execute("SELECT * FROM payments WHERE id=?", (payment_id,))).fetchone()
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔗 Моя реферальная ссылка", callback_data="my_ref")],
+            [InlineKeyboardButton(text="📊 Моя статистика", callback_data="my_stats")],
+            [InlineKeyboardButton(text="🏆 Топ рефералов", callback_data="top_refs")],
+            [InlineKeyboardButton(text="💸 Запросить вывод", callback_data="withdraw")],
+        ]
+    )
 
-async def list_pending_payments(limit: int = 10):
-    async with db_connect() as db:
-        return await (await db.execute("SELECT * FROM payments WHERE status='pending' ORDER BY id ASC LIMIT ?", (limit,))).fetchall()
 
-async def decide_payment(payment_id: int, approve: bool) -> Optional[aiosqlite.Row]:
-    async with db_connect() as db:
-        row = await (await db.execute("SELECT * FROM payments WHERE id=?", (payment_id,))).fetchone()
-        if not row or row["status"] != "pending":
-            return None
-        await db.execute(
-            "UPDATE payments SET status=?, decided_at=? WHERE id=?",
-            ("approved" if approve else "rejected", now_iso(), payment_id)
+def kb_profile(has_access: bool, is_admin: bool) -> InlineKeyboardMarkup:
+    rows = []
+    if has_access:
+        rows.append([InlineKeyboardButton(text="🔗 Моя реферальная ссылка", callback_data="my_ref")])
+        rows.append([InlineKeyboardButton(text="📊 Моя статистика", callback_data="my_stats")])
+    else:
+        rows.append([InlineKeyboardButton(text=f"💳 Купить доступ ({PRICE_ACCESS}$)", callback_data="buy_access")])
+
+    rows.append([InlineKeyboardButton(text="ℹ️ FAQ", callback_data="faq")])
+    rows.append([InlineKeyboardButton(text="💬 Поддержка", callback_data="support")])
+
+    if is_admin:
+        rows.append([InlineKeyboardButton(text="🔐 Админ-панель", callback_data="admin_panel")])
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def kb_payment(purchase_id: int, back_cb: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Проверить оплату", callback_data=f"check_pay:{purchase_id}")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data=back_cb)],
+        ]
+    )
+
+
+# ---------------------------------------------------------------------------
+# Антиспам
+# ---------------------------------------------------------------------------
+
+_user_last_action: dict[int, datetime] = {}
+
+def is_spam(user_id: int) -> bool:
+    now = datetime.utcnow()
+    last = _user_last_action.get(user_id)
+    _user_last_action[user_id] = now
+    if not last:
+        return False
+    return (now - last).total_seconds() < ANTISPAM_SECONDS
+
+
+# ---------------------------------------------------------------------------
+# Bot / Router
+# ---------------------------------------------------------------------------
+
+router = Router()
+BOT_USERNAME_CACHE: str | None = None
+
+
+def is_admin(tg_id: int) -> bool:
+    return tg_id == ADMIN_ID
+
+
+# ---------------------------------------------------------------------------
+# Основные экраны
+# ---------------------------------------------------------------------------
+
+async def show_home(message: Message):
+    text = (
+        f"👋 <b>Привет!</b> Ты в <b>{PROJECT_NAME}</b>\n\n"
+        "Здесь всё построено максимально просто:\n"
+        "1) Ты изучаешь систему перелива трафика (УБД) по модулям\n"
+        "2) Забираешь готовую механику воронки «контент → бот → покупка»\n"
+        "3) При желании подключаешь партнёрку и зарабатываешь на рекомендациях\n\n"
+        f"🎟 <b>{ACCESS_NAME}</b> — <b>{PRICE_ACCESS}$</b> и <b>навсегда</b>.\n"
+        "После оплаты:\n"
+        "• открываются все 8 модулей\n"
+        "• появляется реферальная ссылка\n"
+        "• включается статистика и партнёрские начисления\n\n"
+        "👇 Выбирай раздел снизу: <b>Обучение / Заработок / Профиль</b>"
+    )
+    await message.answer(text, reply_markup=main_kb())
+
+
+async def show_training(target: Message | CallbackQuery, edit: bool = False):
+    if isinstance(target, CallbackQuery):
+        tg_id = target.from_user.id
+        msg = target.message
+    else:
+        tg_id = target.from_user.id
+        msg = target
+
+    has = await has_access_by_tg(tg_id)
+
+    text = (
+        "🧠 <b>Обучение</b>\n\n"
+        "Ниже — структура из <b>8 модулей</b>.\n"
+        "✅ Структура видна всем.\n"
+        "🔒 Открыть каждый модуль можно после оплаты.\n\n"
+        "⚡️ Рекомендация: проходи по порядку — это система.\n"
+    )
+
+    if not has:
+        text += (
+            "\n<b>Чтобы открыть доступ:</b>\n"
+            f"• оплата: <b>{PRICE_ACCESS}$</b> (USDT TRC20)\n"
+            "• доступ навсегда\n"
+            "• партнёрка 50% + 10% включается сразу после оплаты\n"
         )
-        await db.commit()
-        return row
+    else:
+        text += (
+            "\n✅ <b>Доступ открыт</b>\n"
+            "Теперь ты можешь открывать модули + перейти в закрытый канал и группу."
+        )
 
-async def wallet_add(user_id: int, amount: float):
-    async with db_connect() as db:
-        await db.execute("INSERT OR IGNORE INTO wallets(user_id, balance, total_earned) VALUES (?,0,0)", (user_id,))
-        await db.execute("UPDATE wallets SET balance = balance + ?, total_earned = total_earned + ? WHERE user_id=?", (amount, amount, user_id))
-        await db.commit()
+    kb = kb_training(has)
 
-async def wallet_sub(user_id: int, amount: float) -> bool:
-    async with db_connect() as db:
-        w = await (await db.execute("SELECT balance FROM wallets WHERE user_id=?", (user_id,))).fetchone()
-        bal = float(w["balance"]) if w else 0.0
-        if bal + 1e-9 < amount:
-            return False
-        await db.execute("UPDATE wallets SET balance = balance - ? WHERE user_id=?", (amount, user_id))
-        await db.commit()
-        return True
-
-async def apply_ref_earnings(payment_id: int, buyer_id: int, base_amount: float):
-    async with db_connect() as db:
-        u = await (await db.execute("SELECT ref1, ref2 FROM users WHERE user_id=?", (buyer_id,))).fetchone()
-        if not u:
+    if edit and isinstance(target, CallbackQuery):
+        try:
+            await msg.edit_text(text, reply_markup=kb)
             return
-        ref1 = u["ref1"]
-        ref2 = u["ref2"]
-        created = now_iso()
+        except Exception:
+            pass
 
-        if ref1:
-            a1 = round(base_amount * REF_L1, 2)
-            await db.execute(
-                "INSERT OR IGNORE INTO ref_earnings(payment_id, from_user_id, to_user_id, level, amount, created_at) VALUES (?,?,?,?,?,?)",
-                (payment_id, buyer_id, int(ref1), 1, a1, created)
-            )
-            await db.commit()
-            await wallet_add(int(ref1), a1)
+    await msg.answer(text, reply_markup=kb, reply_markup_extra=main_kb() if False else None)
 
-        if ref2:
-            a2 = round(base_amount * REF_L2, 2)
-            await db.execute(
-                "INSERT OR IGNORE INTO ref_earnings(payment_id, from_user_id, to_user_id, level, amount, created_at) VALUES (?,?,?,?,?,?)",
-                (payment_id, buyer_id, int(ref2), 2, a2, created)
-            )
-            await db.commit()
-            await wallet_add(int(ref2), a2)
 
-async def progress_done(user_id: int, module_id: int, lesson_id: int):
-    async with db_connect() as db:
-        await db.execute(
-            "INSERT INTO progress(user_id, module_id, lesson_id, done, updated_at) VALUES (?,?,?,?,?) "
-            "ON CONFLICT(user_id, module_id, lesson_id) DO UPDATE SET done=1, updated_at=excluded.updated_at",
-            (user_id, module_id, lesson_id, 1, now_iso())
+async def show_earn(target: Message | CallbackQuery, edit: bool = False):
+    if isinstance(target, CallbackQuery):
+        tg_id = target.from_user.id
+        msg = target.message
+    else:
+        tg_id = target.from_user.id
+        msg = target
+
+    has = await has_access_by_tg(tg_id)
+
+    if not has:
+        text = (
+            "💸 <b>Заработок</b>\n\n"
+            "У нас простая партнёрка на 2 уровня:\n"
+            f"• <b>50%</b> с 1-й линии\n"
+            f"• <b>10%</b> со 2-й линии\n\n"
+            "⚠️ Но реферальная ссылка и статистика открываются только после покупки полного доступа.\n\n"
+            "Хочешь зарабатывать — открой доступ и получи свою реф-ссылку."
         )
-        await db.commit()
-
-# ---------- Payouts ----------
-async def create_payout(user_id: int, amount: float, details: str) -> int:
-    async with db_connect() as db:
-        cur = await db.execute(
-            "INSERT INTO payouts(user_id, amount, details, status, created_at, decided_at) VALUES (?,?,?,?,?,?)",
-            (user_id, amount, details, "pending", now_iso(), None)
+    else:
+        text = (
+            "💸 <b>Заработок</b>\n\n"
+            "Тут всё по делу:\n"
+            "• твоя реферальная ссылка\n"
+            "• статистика и баланс\n"
+            "• топ партнёров\n"
+            "• запрос вывода администратору\n\n"
+            "Выбирай действие 👇"
         )
-        await db.commit()
-        return int(cur.lastrowid)
 
-async def list_pending_payouts(limit: int = 10):
-    async with db_connect() as db:
-        return await (await db.execute("SELECT * FROM payouts WHERE status='pending' ORDER BY id ASC LIMIT ?", (limit,))).fetchall()
+    kb = kb_earn(has)
 
-async def decide_payout(payout_id: int, approve: bool) -> Optional[aiosqlite.Row]:
-    async with db_connect() as db:
-        row = await (await db.execute("SELECT * FROM payouts WHERE id=?", (payout_id,))).fetchone()
-        if not row or row["status"] != "pending":
-            return None
-        await db.execute(
-            "UPDATE payouts SET status=?, decided_at=? WHERE id=?",
-            ("approved" if approve else "rejected", now_iso(), payout_id)
+    if edit and isinstance(target, CallbackQuery):
+        try:
+            await msg.edit_text(text, reply_markup=kb)
+            return
+        except Exception:
+            pass
+
+    await msg.answer(text, reply_markup=kb, reply_markup_extra=main_kb() if False else None)
+
+
+async def show_profile(target: Message | CallbackQuery, edit: bool = False):
+    if isinstance(target, CallbackQuery):
+        tg_id = target.from_user.id
+        msg = target.message
+    else:
+        tg_id = target.from_user.id
+        msg = target
+
+    row = await get_user_by_tg(tg_id)
+    if not row:
+        # на всякий случай
+        await get_or_create_user(target.from_user if isinstance(target, Message) else target.from_user, None)
+        row = await get_user_by_tg(tg_id)
+
+    user_db_id = int(row["id"])
+    username = row["username"] or ""
+    first_name = row["first_name"] or ""
+    reg_date = row["reg_date"] or "—"
+    access = bool(row["full_access"])
+    balance = Decimal(row["balance"])
+    total_earned = Decimal(row["total_earned"])
+    lvl1, lvl2 = await count_referrals(user_db_id)
+    progress = await get_progress(user_db_id)
+    progress_str = f"{max(progress+1, 0)}/{len(MODULES)}" if progress >= 0 else f"0/{len(MODULES)}"
+
+    text = (
+        "👤 <b>Профиль</b>\n\n"
+        f"👋 Имя: <b>{first_name or '—'}</b>\n"
+        f"🔹 Username: @{username if username else '—'}\n"
+        f"🆔 ID: <code>{tg_id}</code>\n"
+        f"📅 Регистрация: <b>{reg_date}</b>\n\n"
+        f"🎟 Доступ: <b>{'Открыт ✅' if access else 'Не оплачен ❌'}</b>\n"
+        f"📚 Прогресс обучения: <b>{progress_str}</b>\n\n"
+        "🤝 <b>Партнёрка</b>\n"
+        f"• 1 линия: <b>{lvl1}</b>\n"
+        f"• 2 линия: <b>{lvl2}</b>\n\n"
+        f"💰 Баланс к выводу: <b>{balance.quantize(Decimal('0.01'))}$</b>\n"
+        f"🏦 Всего заработано: <b>{total_earned.quantize(Decimal('0.01'))}$</b>"
+    )
+
+    kb = kb_profile(access, is_admin(tg_id))
+
+    if edit and isinstance(target, CallbackQuery):
+        try:
+            await msg.edit_text(text, reply_markup=kb)
+            return
+        except Exception:
+            pass
+
+    await msg.answer(text, reply_markup=kb)
+
+
+# ---------------------------------------------------------------------------
+# /start
+# ---------------------------------------------------------------------------
+
+@router.message(CommandStart())
+async def cmd_start(message: Message):
+    if is_spam(message.from_user.id):
+        return
+
+    args = (message.text or "").split(maxsplit=1)
+    ref_tg_id = None
+    if len(args) > 1 and args[1].startswith("ref_"):
+        try:
+            ref_tg_id = int(args[1].split("_", 1)[1])
+        except Exception:
+            ref_tg_id = None
+
+    await get_or_create_user(message.from_user, ref_tg_id)
+    await show_home(message)
+
+
+# ---------------------------------------------------------------------------
+# Нижнее меню (ReplyKeyboard)
+# ---------------------------------------------------------------------------
+
+@router.message(F.text == "🧠 Обучение")
+async def menu_training(message: Message):
+    if is_spam(message.from_user.id):
+        return
+    await show_training(message)
+
+
+@router.message(F.text == "💸 Заработок")
+async def menu_earn(message: Message):
+    if is_spam(message.from_user.id):
+        return
+    await show_earn(message)
+
+
+@router.message(F.text == "👤 Профиль")
+async def menu_profile(message: Message):
+    if is_spam(message.from_user.id):
+        return
+    await show_profile(message)
+
+
+# ---------------------------------------------------------------------------
+# Обучение: модули (lock/open)
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data.startswith("locked:"))
+async def cb_locked_module(call: CallbackQuery):
+    await call.answer("🔒 Модуль закрыт. Сначала оплати доступ.", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("mod:"))
+async def cb_open_module(call: CallbackQuery):
+    tg_id = call.from_user.id
+    if not await has_access_by_tg(tg_id):
+        await call.answer("🔒 Сначала оплати доступ.", show_alert=True)
+        return
+
+    idx = int(call.data.split(":", 1)[1])
+    idx = max(0, min(idx, len(MODULES) - 1))
+
+    user = await get_user_by_tg(tg_id)
+    if user:
+        await save_progress(int(user["id"]), idx)
+
+    title = MODULES[idx]
+    text = f"🧠 <b>{title}</b>\n\n{MODULE_TEXT_PLACEHOLDER}"
+    try:
+        await call.message.edit_text(text, reply_markup=kb_training(True))
+    except Exception:
+        await call.message.answer(text, reply_markup=kb_training(True))
+
+    await call.answer()
+
+
+# ---------------------------------------------------------------------------
+# Заработок: инфо / реф / статистика / топ
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data == "earn_info")
+async def cb_earn_info(call: CallbackQuery):
+    text = (
+        "📌 <b>Как работает партнёрка</b>\n\n"
+        f"✅ После оплаты доступа (<b>{PRICE_ACCESS}$</b>) ты получаешь:\n"
+        "• личную реферальную ссылку\n"
+        "• статистику по партнёрам\n"
+        "• начисления на баланс\n\n"
+        "💰 Начисления:\n"
+        f"• <b>50%</b> с 1-й линии\n"
+        f"• <b>10%</b> со 2-й линии\n\n"
+        "⚠️ Начисления идут только с покупки полного доступа."
+    )
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Открыть доступ", callback_data="buy_access")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="back:earn")],
+        ]
+    )
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+
+@router.callback_query(F.data == "my_ref")
+async def cb_my_ref(call: CallbackQuery):
+    if not await has_access_by_tg(call.from_user.id):
+        text = (
+            "🔗 <b>Реферальная ссылка</b>\n\n"
+            "Сначала открой полный доступ — и здесь появится твоя реф-ссылка + статистика."
         )
-        await db.commit()
-        return row
+        try:
+            await call.message.edit_text(text, reply_markup=kb_buy("back:profile"))
+        except Exception:
+            await call.message.answer(text, reply_markup=kb_buy("back:profile"))
+        await call.answer()
+        return
 
-# ---------- FSM ----------
-class AdminFSM(StatesGroup):
-    grant = State()
-    revoke = State()
-    broadcast = State()
+    global BOT_USERNAME_CACHE
+    if not BOT_USERNAME_CACHE:
+        me = await call.bot.get_me()
+        BOT_USERNAME_CACHE = me.username
 
-class PayoutFSM(StatesGroup):
-    amount = State()
-    details = State()
+    ref_link = f"https://t.me/{BOT_USERNAME_CACHE}?start=ref_{call.from_user.id}"
 
-# ---------- Bot / Routers ----------
-bot = Bot(
-    BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML, protect_content=True)
-)
-dp = Dispatcher(storage=MemoryStorage())
-r = Router()
-dp.include_router(r)
+    text = (
+        "🔗 <b>Твоя реферальная ссылка</b>\n\n"
+        f"<code>{ref_link}</code>\n\n"
+        "Как использовать:\n"
+        "• вставляй ссылку в TikTok/Instagram/YouTube Shorts\n"
+        "• веди трафик сразу в бота (без прогрев-канала)\n"
+        "• получай начисления с оплат партнёров\n\n"
+        "⚠️ Не спамь. Делай нормальный контент и связки — так будет конверт."
+    )
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📊 Моя статистика", callback_data="my_stats")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="back:earn")],
+        ]
+    )
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await call.message.answer(text, reply_markup=kb)
+    await call.answer()
 
-async def safe_edit(call: CallbackQuery, text: str, kb: Optional[InlineKeyboardMarkup] = None):
+
+@router.callback_query(F.data == "my_stats")
+async def cb_my_stats(call: CallbackQuery):
+    row = await get_user_by_tg(call.from_user.id)
+    if not row:
+        await call.answer("Сначала нажми /start", show_alert=True)
+        return
+
+    user_db_id = int(row["id"])
+    lvl1, lvl2 = await count_referrals(user_db_id)
+    balance = Decimal(row["balance"])
+    total_earned = Decimal(row["total_earned"])
+    access = bool(row["full_access"])
+
+    text = (
+        "📊 <b>Моя статистика</b>\n\n"
+        f"Доступ: <b>{'Открыт ✅' if access else 'Не оплачен ❌'}</b>\n\n"
+        f"👥 Партнёры 1 линии: <b>{lvl1}</b>\n"
+        f"👥 Партнёры 2 линии: <b>{lvl2}</b>\n"
+        f"👥 Всего: <b>{lvl1 + lvl2}</b>\n\n"
+        f"💰 Баланс к выводу: <b>{balance.quantize(Decimal('0.01'))}$</b>\n"
+        f"🏦 Всего заработано: <b>{total_earned.quantize(Decimal('0.01'))}$</b>"
+    )
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔗 Моя реферальная ссылка", callback_data="my_ref")],
+            [InlineKeyboardButton(text="🏆 Топ рефералов", callback_data="top_refs")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="back:earn")],
+        ]
+    )
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+
+@router.callback_query(F.data == "top_refs")
+async def cb_top_refs(call: CallbackQuery):
+    rows = await top_referrers(10)
+    if not rows:
+        text = "🏆 <b>Топ рефералов</b>\n\nПока тут пусто. Стань первым 😄"
+    else:
+        lines = ["🏆 <b>Топ рефералов (1 линия)</b>\n"]
+        for i, r in enumerate(rows, start=1):
+            name = f"@{r['username']}" if r["username"] else (r["first_name"] or "Без имени")
+            lines.append(f"{i}. {name} — <b>{r['cnt']}</b>")
+        text = "\n".join(lines)
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📊 Моя статистика", callback_data="my_stats")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="back:earn")],
+        ]
+    )
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+
+@router.callback_query(F.data == "withdraw")
+async def cb_withdraw(call: CallbackQuery):
+    row = await get_user_by_tg(call.from_user.id)
+    if not row:
+        await call.answer("Сначала нажми /start", show_alert=True)
+        return
+
+    if not bool(row["full_access"]):
+        await call.answer("Сначала открой доступ — партнёрка активируется после оплаты.", show_alert=True)
+        return
+
+    balance = Decimal(row["balance"])
+    text = (
+        "💸 <b>Запрос вывода</b>\n\n"
+        f"Твой текущий баланс: <b>{balance.quantize(Decimal('0.01'))}$</b>\n\n"
+        "Чтобы запросить вывод, напиши администратору в поддержку и укажи:\n"
+        "• сумму\n"
+        "• твой USDT-адрес (TRC20)\n"
+        "• скрин/ID профиля (если нужно)\n\n"
+        f"Поддержка: {SUPPORT_CONTACT}"
+    )
+    try:
+        await call.message.edit_text(text, reply_markup=kb_back("back:earn"))
+    except Exception:
+        await call.message.answer(text, reply_markup=kb_back("back:earn"))
+
+    # можно тихо уведомить админа (не обязательно)
+    try:
+        await call.bot.send_message(
+            ADMIN_ID,
+            f"📥 <b>Запрос вывода</b>\n"
+            f"От: <code>{call.from_user.id}</code>\n"
+            f"Username: @{call.from_user.username or '—'}\n"
+            f"Баланс: {balance}$",
+        )
+    except Exception:
+        pass
+
+    await call.answer()
+
+
+# ---------------------------------------------------------------------------
+# Profile: FAQ / Support
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data == "faq")
+async def cb_faq(call: CallbackQuery):
+    text = (
+        "ℹ️ <b>FAQ</b>\n\n"
+        f"❓ <b>Что входит в доступ за {PRICE_ACCESS}$?</b>\n"
+        "• 8 модулей обучения по переливу трафика (УБД)\n"
+        "• доступ к закрытому каналу/материалам\n"
+        "• партнёрка 50% + 10%\n"
+        "• реферальная ссылка + статистика\n\n"
+        "❓ <b>Доступ навсегда?</b>\n"
+        "Да. Оплата один раз.\n\n"
+        "❓ <b>Что если оплатил, а доступ не открылся?</b>\n"
+        "Нажми «Проверить оплату». Если сеть задержала транзакцию — подожди пару минут.\n"
+        f"Если всё равно нет — напиши в поддержку: {SUPPORT_CONTACT}\n\n"
+        "⚠️ <b>Важно</b>\n"
+        "Результат зависит от твоих действий. Бот — это инструмент, а не «волшебная кнопка»."
+    )
+    try:
+        await call.message.edit_text(text, reply_markup=kb_back("back:profile"))
+    except Exception:
+        await call.message.answer(text, reply_markup=kb_back("back:profile"))
+    await call.answer()
+
+
+@router.callback_query(F.data == "support")
+async def cb_support(call: CallbackQuery):
+    text = (
+        "💬 <b>Поддержка</b>\n\n"
+        f"Пиши сюда: {SUPPORT_CONTACT}\n\n"
+        "Если вопрос по оплате — сразу отправь:\n"
+        "• сумму\n"
+        "• время оплаты\n"
+        "• tx hash (если есть)\n"
+    )
+    try:
+        await call.message.edit_text(text, reply_markup=kb_back("back:profile"))
+    except Exception:
+        await call.message.answer(text, reply_markup=kb_back("back:profile"))
+    await call.answer()
+
+
+# ---------------------------------------------------------------------------
+# Покупка доступа / Проверка оплаты
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data == "buy_access")
+async def cb_buy_access(call: CallbackQuery):
+    # если уже есть доступ — не показываем оплату
+    if await has_access_by_tg(call.from_user.id):
+        await call.answer("✅ У тебя уже открыт доступ.", show_alert=True)
+        return
+
+    user_row = await get_user_by_tg(call.from_user.id)
+    if not user_row:
+        await get_or_create_user(call.from_user, None)
+        user_row = await get_user_by_tg(call.from_user.id)
+
+    user_db_id = int(user_row["id"])
+    purchase_id = await create_purchase(user_db_id, "access", PRICE_ACCESS)
+    purchase = await get_purchase(purchase_id)
+    amount = Decimal(purchase["amount"])
+
+    text = (
+        f"💳 <b>Оплата доступа ({PRICE_ACCESS}$)</b>\n\n"
+        "Оплата в <b>USDT (TRC20)</b>.\n\n"
+        f"Кошелёк для оплаты:\n<code>{WALLET_ADDRESS}</code>\n\n"
+        f"Сумма к оплате: <b>{amount} USDT</b>\n\n"
+        "⚠️ Важно: отправь <b>ТОЧНО</b> эту сумму (с хвостиком), иначе бот не сопоставит платёж.\n\n"
+        "После оплаты нажми «Проверить оплату»."
+    )
+
+    # куда возвращаться: обучение (чаще всего человек там)
+    kb = kb_payment(purchase_id, back_cb="back:training")
+
     try:
         await call.message.edit_text(text, reply_markup=kb)
     except Exception:
         await call.message.answer(text, reply_markup=kb)
 
-# ---------- Handlers ----------
-@r.message(CommandStart())
-async def on_start(message: Message):
-    payload = ""
-    if message.text and len(message.text.split(maxsplit=1)) == 2:
-        payload = message.text.split(maxsplit=1)[1].strip()
-
-    ref_id = None
-    source = ""
-    if payload.startswith("ref_"):
-        try:
-            ref_id = int(payload.replace("ref_", "").strip())
-        except Exception:
-            ref_id = None
-    elif payload.startswith("src_"):
-        source = payload.replace("src_", "")[:32]
-
-    await upsert_user(
-        user_id=message.from_user.id,
-        username=message.from_user.username or "",
-        first_name=message.from_user.first_name or "",
-        source=source,
-        ref_id=ref_id
-    )
-
-    access = await get_access(message.from_user.id)
-    await message.answer(
-        "👋 <b>Traffic Partner Bot</b>\n\n"
-        "Обучение по арбитражу трафика (TikTok) + партнёрка.\n\n"
-        "Выбирай действие 👇",
-        reply_markup=kb_main(access, is_admin(message.from_user.id)),
-    )
-
-@r.callback_query(F.data == "menu")
-async def cb_menu(call: CallbackQuery):
-    access = await get_access(call.from_user.id)
-    await safe_edit(
-        call,
-        "🏠 <b>Меню</b>",
-        kb_main(access, is_admin(call.from_user.id))
-    )
     await call.answer()
 
-@r.callback_query(F.data == "about")
-async def cb_about(call: CallbackQuery):
-    text = (
-        "🔥 <b>Что внутри</b>\n\n"
-        "Ты получишь пошаговую систему арбитража с TikTok:\n"
-        "• аккаунты и безопасность\n"
-        "• креативы и тесты\n"
-        "• перелив в Telegram и прогрев\n"
-        "• масштабирование и система\n\n"
-        f"💳 Доступ навсегда: <b>${PRICE_USD:.0f}</b>\n"
-        f"💬 По оплате: {SUPPORT_USERNAME}\n\n"
-        "После оплаты кнопка покупки исчезнет и откроется обучение ✅"
-    )
-    await safe_edit(call, text, InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💳 Купить доступ", callback_data="buy")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu")],
-    ]))
-    await call.answer()
 
-@r.callback_query(F.data == "buy")
-async def cb_buy(call: CallbackQuery):
-    if await get_access(call.from_user.id):
-        await call.answer("У тебя уже есть доступ ✅", show_alert=True)
-        return
-
-    text = (
-        "💳 <b>Покупка доступа</b>\n\n"
-        f"Цена: <b>${PRICE_USD:.0f}</b>\n"
-        "Доступ: <b>навсегда</b>\n\n"
-        f"1) Напиши админу: {SUPPORT_USERNAME}\n"
-        "2) Оплати\n"
-        "3) Вернись сюда и нажми «Я оплатил»\n\n"
-        "Админ подтвердит — доступ откроется автоматически ✅"
-    )
-    await safe_edit(call, text, kb_buy())
-    await call.answer()
-
-@r.callback_query(F.data == "paid")
-async def cb_paid(call: CallbackQuery):
-    pid = await create_payment_request(call.from_user.id)
-    if pid is None:
-        await call.answer("Заявка уже есть или доступ уже активен ✅", show_alert=True)
-        return
-
-    # notify admin
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ Approve", callback_data=f"adm_pay:ok:{pid}"),
-            InlineKeyboardButton(text="❌ Reject", callback_data=f"adm_pay:no:{pid}")
-        ]
-    ])
+@router.callback_query(F.data.startswith("check_pay:"))
+async def cb_check_pay(call: CallbackQuery):
     try:
-        await bot.send_message(
-            ADMIN_ID,
-            f"💳 <b>Новая заявка на оплату</b>\n"
-            f"Payment ID: <code>{pid}</code>\n"
-            f"User: <code>{call.from_user.id}</code> (@{call.from_user.username or '—'})\n"
-            f"Amount: <b>${PRICE_USD:.0f}</b>",
-            reply_markup=kb,
-            protect_content=False
+        purchase_id = int(call.data.split(":", 1)[1])
+    except Exception:
+        await call.answer("Некорректный ID оплаты.", show_alert=True)
+        return
+
+    purchase = await get_purchase(purchase_id)
+    if not purchase:
+        await call.answer("Оплата не найдена. Попробуй заново.", show_alert=True)
+        return
+
+    # безопасность: проверяем что это покупка этого пользователя
+    user_row = await get_user_by_tg(call.from_user.id)
+    if not user_row or int(user_row["id"]) != int(purchase["user_id"]):
+        await call.answer("Эта оплата не принадлежит тебе.", show_alert=True)
+        return
+
+    if purchase["status"] == "paid":
+        await call.answer("Уже подтверждено ✅", show_alert=True)
+        return
+
+    amount = Decimal(purchase["amount"])
+    created_at = datetime.strptime(purchase["created_at"], "%Y-%m-%d %H:%M:%S")
+
+    await call.answer("🔎 Проверяю транзакции в Tron...")
+
+    tx_id = await find_payment_for_amount(amount, created_at)
+    if not tx_id:
+        text = (
+            "❌ <b>Платёж пока не найден</b>\n\n"
+            "Проверь:\n"
+            "• ты отправил <b>точно</b> указанную сумму\n"
+            "• ты отправил на <b>правильный</b> адрес\n"
+            "• прошло ли 1–3 минуты (иногда сеть задерживает)\n\n"
+            "Если всё ок, просто попробуй ещё раз через минуту."
         )
-    except Exception as e:
-        log.warning("Cannot notify admin: %s", e)
-
-    await safe_edit(
-        call,
-        "⏳ Заявка отправлена админу. После подтверждения доступ откроется автоматически.",
-        InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🏠 Меню", callback_data="menu")]])
-    )
-    await call.answer()
-
-@r.callback_query(F.data.startswith("adm_pay:"))
-async def cb_admin_payment(call: CallbackQuery):
-    if not is_admin(call.from_user.id):
-        await call.answer("Нет доступа", show_alert=True)
-        return
-
-    _, decision, pid_s = call.data.split(":")
-    pid = int(pid_s)
-    approve = decision == "ok"
-
-    row = await decide_payment(pid, approve)
-    if not row:
-        await call.answer("Уже обработано / не найдено", show_alert=True)
-        return
-
-    buyer_id = int(row["user_id"])
-    buyer_had_access = await get_access(buyer_id)
-
-    if approve:
-        # выдаём доступ
-        await set_access(buyer_id, True)
-
-        # начисляем партнёрку только если доступ был неактивен до подтверждения
-        if not buyer_had_access:
-            await apply_ref_earnings(pid, buyer_id, base_amount=float(PRICE_USD))
-
-        # уведомим покупателя
         try:
-            await bot.send_message(
-                buyer_id,
-                "✅ <b>Оплата подтверждена!</b>\n\n"
-                "Доступ открыт <b>навсегда</b>. Заходи в «📚 Обучение».",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🏠 Меню", callback_data="menu")]])
-            )
+            await call.message.edit_text(text, reply_markup=kb_payment(purchase_id, "back:training"))
         except Exception:
-            pass
+            await call.message.answer(text, reply_markup=kb_payment(purchase_id, "back:training"))
+        return
 
-        await safe_edit(call, f"✅ Approved payment <code>{pid}</code>", kb_admin())
+    await mark_purchase_paid(purchase_id, tx_id)
+    purchase2 = await get_purchase(purchase_id)
+    await process_successful_payment(call.bot, purchase2)
+
+    # после оплаты — показываем обучение (уже открыто)
+    try:
+        await show_training(call, edit=True)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Back navigation callbacks
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data.startswith("back:"))
+async def cb_back(call: CallbackQuery):
+    where = call.data.split(":", 1)[1]
+    if where == "training":
+        await show_training(call, edit=True)
+    elif where == "earn":
+        await show_earn(call, edit=True)
+    elif where == "profile":
+        await show_profile(call, edit=True)
     else:
-        try:
-            await bot.send_message(buyer_id, "❌ Оплата отклонена. Напиши в поддержку.")
-        except Exception:
-            pass
-        await safe_edit(call, f"❌ Rejected payment <code>{pid}</code>", kb_admin())
-
+        await show_home(call.message)
     await call.answer()
 
-@r.callback_query(F.data == "learn")
-async def cb_learn(call: CallbackQuery):
-    if not await get_access(call.from_user.id):
-        await call.answer("Сначала купи доступ 💳", show_alert=True)
-        return
-    await safe_edit(call, "📚 <b>Обучение</b>\nВыбери модуль 👇", kb_modules())
-    await call.answer()
 
-@r.callback_query(F.data.startswith("mod:"))
-async def cb_mod(call: CallbackQuery):
-    if not await get_access(call.from_user.id):
-        await call.answer("Нет доступа 💳", show_alert=True)
-        return
-    module_id = int(call.data.split(":", 1)[1])
-    await safe_edit(call, f"📦 <b>Модуль {module_id}</b>: {COURSE[module_id]['title']}", kb_lessons(module_id))
-    await call.answer()
+# ---------------------------------------------------------------------------
+# Admin panel
+# ---------------------------------------------------------------------------
 
-@r.callback_query(F.data.startswith("lesson:"))
-async def cb_lesson(call: CallbackQuery):
-    if not await get_access(call.from_user.id):
-        await call.answer("Нет доступа 💳", show_alert=True)
-        return
-    _, m, l = call.data.split(":")
-    module_id = int(m)
-    lesson_id = int(l)
-
-    lessons: List[Tuple[int, str, str]] = COURSE[module_id]["lessons"]  # type: ignore
-    match = [x for x in lessons if x[0] == lesson_id]
-    if not match:
-        await call.answer("Урок не найден", show_alert=True)
-        return
-    _, title, body = match[0]
-
-    # анти-копипаст только для тела урока
-    safe_body = obfuscate_for_copy(body)
-
-    text = (
-        f"📘 <b>Модуль {module_id} • Урок {lesson_id}</b>\n"
-        f"<b>{title}</b>\n\n"
-        f"{safe_body}"
-    )
-    await safe_edit(call, text, kb_lesson_nav(module_id, lesson_id))
-    await call.answer()
-
-@r.callback_query(F.data.startswith("done:"))
-async def cb_done(call: CallbackQuery):
-    if not await get_access(call.from_user.id):
-        await call.answer("Нет доступа 💳", show_alert=True)
-        return
-    _, m, l = call.data.split(":")
-    module_id = int(m)
-    lesson_id = int(l)
-    await progress_done(call.from_user.id, module_id, lesson_id)
-    await call.answer("Отмечено ✅", show_alert=True)
-
-@r.callback_query(F.data == "profile")
-async def cb_profile(call: CallbackQuery):
-    access = await get_access(call.from_user.id)
-    balance, invited1, done_cnt, total_lessons = await get_stats(call.from_user.id)
-
-    text = (
-        "👤 <b>Профиль</b>\n\n"
-        f"ID: <code>{call.from_user.id}</code>\n"
-        f"Статус: {'✅ доступ активен' if access else '❌ нет доступа'}\n"
-        f"Прогресс: <b>{done_cnt}/{total_lessons}</b>\n\n"
-        f"Баланс партнёрки: <b>${balance:.2f}</b>\n"
-        f"Рефералы 1 уровня: <b>{invited1}</b>\n"
-    )
-    await safe_edit(call, text, InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎁 Партнёрка", callback_data="partner")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu")],
-    ]))
-    await call.answer()
-
-@r.callback_query(F.data == "partner")
-async def cb_partner(call: CallbackQuery):
-    me = await bot.get_me()
-    link = f"https://t.me/{me.username}?start=ref_{call.from_user.id}"
-
-    access = await get_access(call.from_user.id)
-    balance, invited1, _, _ = await get_stats(call.from_user.id)
-
-    text = (
-        "🎁 <b>Партнёрка</b>\n\n"
-        "Начисления:\n"
-        f"• 1 уровень: <b>{int(REF_L1*100)}%</b>\n"
-        f"• 2 уровень: <b>{int(REF_L2*100)}%</b>\n\n"
-        f"Баланс: <b>${balance:.2f}</b>\n"
-        f"Рефералы (1 уровень): <b>{invited1}</b>\n\n"
-        f"🔗 Твоя реф-ссылка:\n<code>{link}</code>\n\n"
-        + ("✅ Вывод доступен." if access else "ℹ️ Рекомендуется купить доступ, чтобы пользоваться всем функционалом.")
-    )
-    await safe_edit(call, text, kb_partner())
-    await call.answer()
-
-# ---------- Payout flow ----------
-@r.callback_query(F.data == "payout")
-async def cb_payout(call: CallbackQuery, state: FSMContext):
-    if not await get_access(call.from_user.id):
-        await call.answer("Вывод доступен после покупки доступа 💳", show_alert=True)
-        return
-    balance, _, _, _ = await get_stats(call.from_user.id)
-    await state.set_state(PayoutFSM.amount)
-    await safe_edit(
-        call,
-        "💸 <b>Запрос вывода</b>\n\n"
-        f"Баланс: <b>${balance:.2f}</b>\n"
-        f"Минималка: <b>${MIN_PAYOUT:.2f}</b>\n\n"
-        "Введи сумму числом (например 25 или 25.5):",
-        kb_back("partner")
-    )
-    await call.answer()
-
-@r.message(PayoutFSM.amount)
-async def payout_amount(message: Message, state: FSMContext):
-    try:
-        amount = float((message.text or "").replace(",", ".").strip())
-    except Exception:
-        await message.answer("Введи число (пример: 25 или 25.5).")
-        return
-
-    if amount < MIN_PAYOUT:
-        await message.answer(f"Минималка: ${MIN_PAYOUT:.2f}")
-        return
-
-    balance, *_ = await get_stats(message.from_user.id)
-    if balance + 1e-9 < amount:
-        await message.answer(f"Недостаточно средств. Баланс: ${balance:.2f}")
-        return
-
-    await state.update_data(amount=amount)
-    await state.set_state(PayoutFSM.details)
-    await message.answer(
-        "Ок ✅\nТеперь отправь реквизиты для вывода (карта/USDT TRC20 и т.д.):\n\n"
-        "Пример: USDT TRC20: Txxxx..."
-    )
-
-@r.message(PayoutFSM.details)
-async def payout_details(message: Message, state: FSMContext):
-    data = await state.get_data()
-    amount = float(data["amount"])
-    details = (message.text or "").strip()
-    if len(details) < 5:
-        await message.answer("Реквизиты слишком короткие. Отправь нормально.")
-        return
-
-    # списываем сразу, чтобы не было двойных заявок
-    ok = await wallet_sub(message.from_user.id, amount)
-    if not ok:
-        bal, *_ = await get_stats(message.from_user.id)
-        await message.answer(f"Недостаточно средств. Баланс: ${bal:.2f}")
-        await state.clear()
-        return
-
-    rid = await create_payout(message.from_user.id, amount, details)
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ Approve", callback_data=f"adm_out:ok:{rid}"),
-            InlineKeyboardButton(text="❌ Reject", callback_data=f"adm_out:no:{rid}")
-        ]
-    ])
-    try:
-        await bot.send_message(
-            ADMIN_ID,
-            f"💸 <b>Заявка на вывод</b>\n"
-            f"ID: <code>{rid}</code>\n"
-            f"User: <code>{message.from_user.id}</code>\n"
-            f"Amount: <b>${amount:.2f}</b>\n"
-            f"Details: <code>{details}</code>",
-            reply_markup=kb,
-            protect_content=False
-        )
-    except Exception:
-        pass
-
-    await message.answer("✅ Заявка создана. Админ проверит и подтвердит.")
-    await state.clear()
-
-@r.callback_query(F.data.startswith("adm_out:"))
-async def cb_admin_payout(call: CallbackQuery):
-    if not is_admin(call.from_user.id):
-        await call.answer("Нет доступа", show_alert=True)
-        return
-    _, decision, rid_s = call.data.split(":")
-    rid = int(rid_s)
-    approve = decision == "ok"
-
-    row = await decide_payout(rid, approve)
-    if not row:
-        await call.answer("Уже обработано / не найдено", show_alert=True)
-        return
-
-    uid = int(row["user_id"])
-    amount = float(row["amount"])
-
-    if approve:
-        try:
-            await bot.send_message(uid, f"✅ Вывод подтверждён: ${amount:.2f}")
-        except Exception:
-            pass
-        await safe_edit(call, f"✅ Approved payout <code>{rid}</code>", kb_admin())
-    else:
-        # refund
-        await wallet_add(uid, amount)
-        try:
-            await bot.send_message(uid, f"❌ Вывод отклонён. Сумма возвращена на баланс: ${amount:.2f}")
-        except Exception:
-            pass
-        await safe_edit(call, f"❌ Rejected payout <code>{rid}</code> (refunded)", kb_admin())
-
-    await call.answer()
-
-# ---------- Admin panel ----------
-@r.callback_query(F.data == "admin")
-async def cb_admin(call: CallbackQuery):
-    if not is_admin(call.from_user.id):
-        await call.answer("Нет доступа", show_alert=True)
-        return
-    await safe_edit(call, "🛠 <b>Админ панель</b>", kb_admin())
-    await call.answer()
-
-@r.callback_query(F.data.startswith("adm:"))
-async def cb_adm_actions(call: CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id):
-        await call.answer("Нет доступа", show_alert=True)
-        return
-
-    action = call.data.split(":", 1)[1]
-
-    if action == "payments":
-        rows = await list_pending_payments(10)
-        if not rows:
-            await safe_edit(call, "✅ Pending оплат нет.", kb_admin())
-            await call.answer()
-            return
-        lines = ["💳 <b>Pending оплаты</b>\n"]
-        kb_rows = []
-        for row in rows:
-            pid = int(row["id"])
-            uid = int(row["user_id"])
-            lines.append(f"• <code>{pid}</code> | user <code>{uid}</code> | ${float(row['amount']):.0f}")
-            kb_rows.append([
-                InlineKeyboardButton(text=f"✅ #{pid}", callback_data=f"adm_pay:ok:{pid}"),
-                InlineKeyboardButton(text=f"❌ #{pid}", callback_data=f"adm_pay:no:{pid}")
-            ])
-        kb_rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin")])
-        await safe_edit(call, "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=kb_rows))
-        await call.answer()
-        return
-
-    if action == "payouts":
-        rows = await list_pending_payouts(10)
-        if not rows:
-            await safe_edit(call, "✅ Pending выводов нет.", kb_admin())
-            await call.answer()
-            return
-        lines = ["💸 <b>Pending выводы</b>\n"]
-        kb_rows = []
-        for row in rows:
-            rid = int(row["id"])
-            uid = int(row["user_id"])
-            amount = float(row["amount"])
-            lines.append(f"• <code>{rid}</code> | user <code>{uid}</code> | ${amount:.2f}")
-            kb_rows.append([
-                InlineKeyboardButton(text=f"✅ #{rid}", callback_data=f"adm_out:ok:{rid}"),
-                InlineKeyboardButton(text=f"❌ #{rid}", callback_data=f"adm_out:no:{rid}")
-            ])
-        kb_rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin")])
-        await safe_edit(call, "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=kb_rows))
-        await call.answer()
-        return
-
-    if action == "users":
-        async with db_connect() as db:
-            rows = await (await db.execute(
-                "SELECT user_id, username, access, created_at FROM users ORDER BY created_at DESC LIMIT 30"
-            )).fetchall()
-        if not rows:
-            await safe_edit(call, "Пользователей нет.", kb_admin())
-            await call.answer()
-            return
-        lines = ["👥 <b>Последние пользователи</b>\n"]
-        for u in rows:
-            acc = "✅" if int(u["access"]) == 1 else "❌"
-            uname = f"@{u['username']}" if u["username"] else "—"
-            lines.append(f"{acc} <code>{u['user_id']}</code> {uname}")
-        await safe_edit(call, "\n".join(lines), kb_admin())
-        await call.answer()
-        return
-
-    if action == "grant":
-        await state.set_state(AdminFSM.grant)
-        await safe_edit(call, "🎟 Введи Telegram ID пользователя (цифры), кому выдать доступ:", kb_back("admin"))
-        await call.answer()
-        return
-
-    if action == "revoke":
-        await state.set_state(AdminFSM.revoke)
-        await safe_edit(call, "⛔ Введи Telegram ID пользователя (цифры), у кого отозвать доступ:", kb_back("admin"))
-        await call.answer()
-        return
-
-    if action == "broadcast":
-        await state.set_state(AdminFSM.broadcast)
-        await safe_edit(call, "📣 Отправь текст рассылки одним сообщением:", kb_back("admin"))
-        await call.answer()
-        return
-
-    await call.answer()
-
-@r.message(AdminFSM.grant)
-async def admin_grant(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    if not (message.text or "").strip().isdigit():
-        await message.answer("Нужно число (Telegram ID).")
-        return
-    uid = int(message.text.strip())
-    await set_access(uid, True)
-    try:
-        await bot.send_message(uid, "✅ Админ выдал доступ навсегда.", reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="🏠 Меню", callback_data="menu")]]
-        ))
-    except Exception:
-        pass
-    await message.answer("Готово ✅", reply_markup=kb_admin())
-    await state.clear()
-
-@r.message(AdminFSM.revoke)
-async def admin_revoke(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    if not (message.text or "").strip().isdigit():
-        await message.answer("Нужно число (Telegram ID).")
-        return
-    uid = int(message.text.strip())
-    await set_access(uid, False)
-    try:
-        await bot.send_message(uid, "⛔ Доступ отозван админом.")
-    except Exception:
-        pass
-    await message.answer("Готово ⛔", reply_markup=kb_admin())
-    await state.clear()
-
-@r.message(AdminFSM.broadcast)
-async def admin_broadcast(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    text = (message.text or "").strip()
-    if len(text) < 3:
-        await message.answer("Слишком короткий текст.")
-        return
-
-    async with db_connect() as db:
-        rows = await (await db.execute("SELECT user_id FROM users")).fetchall()
-    user_ids = [int(r["user_id"]) for r in rows]
-
-    sent = 0
-    failed = 0
-    for uid in user_ids:
-        try:
-            await bot.send_message(uid, text, protect_content=False)
-            sent += 1
-        except Exception:
-            failed += 1
-        await asyncio.sleep(0.03)
-
-    await message.answer(f"Рассылка завершена ✅\nSent: {sent}\nFailed: {failed}", reply_markup=kb_admin())
-    await state.clear()
-
-# Commands as backup
-@r.message(Command("admin"))
+@router.message(Command("admin"))
 async def cmd_admin(message: Message):
     if not is_admin(message.from_user.id):
         return
-    access = await get_access(message.from_user.id)
-    await message.answer("🛠 <b>Админ панель</b>", reply_markup=kb_admin())
+
+    text = (
+        "🔐 <b>Админ-панель</b>\n\n"
+        "Команды:\n"
+        "• <code>/grant 123456789</code> — выдать доступ по TG ID\n"
+        "• <code>/grant @username</code> — выдать доступ по username\n"
+        "• <code>/user 123456789</code> — инфо по пользователю\n"
+        "• <code>/stats</code> — общая статистика\n\n"
+        "Также есть кнопки ниже 👇"
+    )
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="👥 Пользователи (последние 20)", callback_data="admin_users")],
+            [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
+        ]
+    )
+    await message.answer(text, reply_markup=kb)
+
+
+async def _find_user_by_identifier(identifier: str):
+    identifier = identifier.strip()
+    async with get_db() as db:
+        if identifier.startswith("@"):
+            username = identifier[1:]
+            cur = await db.execute("SELECT * FROM users WHERE username = ?", (username,))
+            return await cur.fetchone()
+        else:
+            try:
+                tg_id = int(identifier)
+            except Exception:
+                return None
+            cur = await db.execute("SELECT * FROM users WHERE tg_id = ?", (tg_id,))
+            return await cur.fetchone()
+
+
+@router.message(Command("grant"))
+async def cmd_grant(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Использование: <code>/grant 123456789</code> или <code>/grant @username</code>")
+        return
+
+    ident = parts[1].strip()
+    user = await _find_user_by_identifier(ident)
+    if not user:
+        await message.answer("Пользователь не найден в базе. Пусть сначала нажмёт /start.")
+        return
+
+    await set_full_access(int(user["id"]), True)
+    await message.answer("✅ Доступ выдан.")
+    try:
+        await message.bot.send_message(
+            int(user["tg_id"]),
+            "🎟 <b>Тебе выдан доступ администратором.</b>\n\n"
+            "Теперь все модули открыты + партнёрка активна.",
+            reply_markup=main_kb(),
+        )
+    except Exception:
+        pass
+
+
+@router.message(Command("user"))
+async def cmd_user(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Использование: <code>/user 123456789</code> или <code>/user @username</code>")
+        return
+
+    user = await _find_user_by_identifier(parts[1])
+    if not user:
+        await message.answer("Пользователь не найден.")
+        return
+
+    user_db_id = int(user["id"])
+    lvl1, lvl2 = await count_referrals(user_db_id)
+
+    text = (
+        "👤 <b>Пользователь</b>\n\n"
+        f"TG ID: <code>{user['tg_id']}</code>\n"
+        f"Username: @{user['username'] or '—'}\n"
+        f"Имя: {user['first_name'] or '—'}\n"
+        f"Регистрация: {user['reg_date'] or '—'}\n\n"
+        f"Доступ: {'да ✅' if user['full_access'] else 'нет ❌'}\n"
+        f"Рефы: 1л={lvl1}, 2л={lvl2}\n"
+        f"Баланс: {user['balance']}$\n"
+        f"Всего заработано: {user['total_earned']}$"
+    )
+    await message.answer(text)
+
+
+@router.message(Command("stats"))
+async def cmd_stats(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+
+    async with get_db() as db:
+        cur_u = await db.execute("SELECT COUNT(*) AS c FROM users")
+        users_cnt = (await cur_u.fetchone())["c"]
+
+        cur_p = await db.execute("SELECT COUNT(*) AS c FROM purchases WHERE status='paid'")
+        paid_cnt = (await cur_p.fetchone())["c"]
+
+        cur_rev = await db.execute("SELECT amount FROM purchases WHERE status='paid' AND product_code='access'")
+        rows = await cur_rev.fetchall()
+        revenue = sum([Decimal(r["amount"]) for r in rows], Decimal("0"))
+
+    text = (
+        "📊 <b>Статистика</b>\n\n"
+        f"👥 Пользователей: <b>{users_cnt}</b>\n"
+        f"✅ Оплаченных доступов: <b>{paid_cnt}</b>\n"
+        f"💵 Сумма оплат (с хвостами): <b>{revenue.quantize(Decimal('0.001'))} USDT</b>\n"
+    )
+    await message.answer(text)
+
+
+@router.callback_query(F.data == "admin_users")
+async def cb_admin_users(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+
+    async with get_db() as db:
+        cur = await db.execute(
+            "SELECT tg_id, username, first_name, reg_date, full_access FROM users ORDER BY id DESC LIMIT 20"
+        )
+        rows = await cur.fetchall()
+
+    lines = ["👥 <b>Последние 20 пользователей</b>\n"]
+    for r in rows:
+        name = f"@{r['username']}" if r["username"] else (r["first_name"] or "—")
+        lines.append(f"• {name} — <code>{r['tg_id']}</code> — {'✅' if r['full_access'] else '❌'}")
+    text = "\n".join(lines)
+
+    try:
+        await call.message.edit_text(text, reply_markup=kb_back("back:profile"))
+    except Exception:
+        await call.message.answer(text, reply_markup=kb_back("back:profile"))
+    await call.answer()
+
+
+@router.callback_query(F.data == "admin_stats")
+async def cb_admin_stats(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    # просто дергаем /stats-логику
+    fake = Message(message_id=0, date=datetime.now(), chat=call.message.chat, from_user=call.from_user, text="/stats")
+    await cmd_stats(fake)
+    await call.answer()
+
+
+@router.callback_query(F.data == "admin_panel")
+async def cb_admin_panel(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    await call.message.answer("Открой /admin — там команды и кнопки.", reply_markup=main_kb())
+    await call.answer()
+
+
+# ---------------------------------------------------------------------------
+# Fallback
+# ---------------------------------------------------------------------------
+
+@router.message()
+async def fallback(message: Message):
+    if is_spam(message.from_user.id):
+        return
+    await message.answer(
+        "🤔 Я тебя не понял.\n\n"
+        "Используй кнопки снизу: <b>Обучение</b>, <b>Заработок</b>, <b>Профиль</b>.\n"
+        "Или нажми /start, чтобы перезагрузить меню.",
+        reply_markup=main_kb(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# START
+# ---------------------------------------------------------------------------
 
 async def main():
+    bot = Bot(BOT_TOKEN, parse_mode=ParseMode.HTML)
+    dp = Dispatcher()
+    dp.include_router(router)
+
     await init_db()
+
     me = await bot.get_me()
-    log.info("Bot started as @%s | db=%s", me.username, DB_PATH)
-    await dp.start_polling(bot)
+    global BOT_USERNAME_CACHE
+    BOT_USERNAME_CACHE = me.username
+    logger.info("Bot started as @%s", BOT_USERNAME_CACHE)
+
+    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        pass
