@@ -1,9 +1,9 @@
 # ===================== CONFIG (ВСТАВЬ СВОЁ) =====================
-BOT_TOKEN = "PASTE_NEW_BOT_TOKEN_HERE"
+BOT_TOKEN = "8491759417:AAFCnK5ubsubVQPYvdOTp6p0MRJrtA4m5p8"
 ADMIN_ID = 8585550939  # твой Telegram ID (числом)
 
 PRICE_USD = 200.0
-SUPPORT_USERNAME = "@TradeX_Partner_helper"         # куда писать по оплате
+SUPPORT_USERNAME = "@Traffic_Partner_Bot"         # куда писать по оплате
 PRIVATE_GROUP_LINK = "https://t.me/your_private_group"  # ссылка на закрытую группу/чат
 
 REF_L1 = 0.50
