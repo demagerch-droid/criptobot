@@ -725,7 +725,7 @@ async def show_earn(target: Message | CallbackQuery, edit: bool = False):
         except Exception:
             pass
 
-    await msg.answer(text, reply_markup=kb, reply_markup_extra=main_kb() if False else None)
+    await msg.answer(text, reply_markup=kb)
 
 
 async def show_profile(target: Message | CallbackQuery, edit: bool = False):
@@ -1298,11 +1298,7 @@ async def cmd_user(message: Message):
     await message.answer(text)
 
 
-@router.message(Command("stats"))
-async def cmd_stats(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-
+async def build_admin_stats_text() -> str:
     async with get_db() as db:
         cur_u = await db.execute("SELECT COUNT(*) AS c FROM users")
         users_cnt = (await cur_u.fetchone())["c"]
@@ -1320,6 +1316,15 @@ async def cmd_stats(message: Message):
         f"✅ Оплаченных доступов: <b>{paid_cnt}</b>\n"
         f"💵 Сумма оплат (с хвостами): <b>{revenue.quantize(Decimal('0.001'))} USDT</b>\n"
     )
+    return text
+
+
+@router.message(Command("stats"))
+async def cmd_stats(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+
+    text = await build_admin_stats_text()
     await message.answer(text)
 
 
@@ -1353,9 +1358,20 @@ async def cb_admin_stats(call: CallbackQuery):
     if not is_admin(call.from_user.id):
         await call.answer("Нет доступа", show_alert=True)
         return
-    # просто дергаем /stats-логику
-    fake = Message(message_id=0, date=datetime.now(), chat=call.message.chat, from_user=call.from_user, text="/stats")
-    await cmd_stats(fake)
+
+    text = await build_admin_stats_text()
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="👥 Пользователи (последние 20)", callback_data="admin_users")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="back:profile")],
+        ]
+    )
+
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await call.message.answer(text, reply_markup=kb)
+
     await call.answer()
 
 
