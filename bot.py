@@ -1,5 +1,5 @@
 # ===================== CONFIG (ВСТАВЬ СВОЁ) =====================
-BOT_TOKEN = "8491759417:AAFCnK5ubsubVQPYvdOTp6p0MRJrtA4m5p8"
+BOT_TOKEN = "PASTE_NEW_BOT_TOKEN_HERE"
 ADMIN_ID = 8585550939  # твой Telegram ID (числом)
 
 PRICE_USD = 200.0
@@ -20,6 +20,7 @@ from typing import Optional, Dict, List, Tuple
 import aiosqlite
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.client.default import DefaultBotProperties
+from contextlib import asynccontextmanager
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
@@ -116,12 +117,20 @@ async def init_db():
         await db.executescript(SCHEMA)
         await db.commit()
 
+@asynccontextmanager
 async def db_connect():
-    db = await aiosqlite.connect(DB_PATH)
+    # Важно: НЕ делаем "async with await aiosqlite.connect()"
+    # Используем контекст-менеджер, чтобы aiosqlite не пытался стартовать поток дважды.
+    db = await aiosqlite.connect(DB_PATH, timeout=30)
     db.row_factory = aiosqlite.Row
-    return db
+    await db.execute("PRAGMA busy_timeout=30000;")
+    try:
+        yield db
+    finally:
+        await db.close()
 
 # ---------- Anti-copy helper ----------
+
 # Telegram НЕ даёт 100% запретить копирование текста, но:
 # 1) protect_content=True запрещает пересылку/сохранение
 # 2) невидимый символ U+2060 (WORD JOINER) портит копипаст
@@ -261,7 +270,7 @@ def kb_partner() -> InlineKeyboardMarkup:
 
 # ---------- DB helpers ----------
 async def upsert_user(user_id: int, username: str, first_name: str, source: str, ref_id: Optional[int]):
-    async with await db_connect() as db:
+    async with db_connect() as db:
         row = await (await db.execute("SELECT user_id, ref1, ref2 FROM users WHERE user_id=?", (user_id,))).fetchone()
         if row:
             # обновим username/first_name при необходимости
@@ -285,17 +294,17 @@ async def upsert_user(user_id: int, username: str, first_name: str, source: str,
         await db.commit()
 
 async def get_access(user_id: int) -> bool:
-    async with await db_connect() as db:
+    async with db_connect() as db:
         row = await (await db.execute("SELECT access FROM users WHERE user_id=?", (user_id,))).fetchone()
         return bool(row and row["access"] == 1)
 
 async def set_access(user_id: int, value: bool):
-    async with await db_connect() as db:
+    async with db_connect() as db:
         await db.execute("UPDATE users SET access=? WHERE user_id=?", (1 if value else 0, user_id))
         await db.commit()
 
 async def get_stats(user_id: int) -> Tuple[float, int, int, int]:
-    async with await db_connect() as db:
+    async with db_connect() as db:
         w = await (await db.execute("SELECT balance, total_earned FROM wallets WHERE user_id=?", (user_id,))).fetchone()
         balance = float(w["balance"]) if w else 0.0
         total = float(w["total_earned"]) if w else 0.0
@@ -312,7 +321,7 @@ async def get_stats(user_id: int) -> Tuple[float, int, int, int]:
 async def create_payment_request(user_id: int) -> Optional[int]:
     if await get_access(user_id):
         return None
-    async with await db_connect() as db:
+    async with db_connect() as db:
         pending = await (await db.execute("SELECT id FROM payments WHERE user_id=? AND status='pending' ORDER BY id DESC LIMIT 1", (user_id,))).fetchone()
         if pending:
             return None
@@ -324,15 +333,15 @@ async def create_payment_request(user_id: int) -> Optional[int]:
         return int(cur.lastrowid)
 
 async def get_payment(payment_id: int):
-    async with await db_connect() as db:
+    async with db_connect() as db:
         return await (await db.execute("SELECT * FROM payments WHERE id=?", (payment_id,))).fetchone()
 
 async def list_pending_payments(limit: int = 10):
-    async with await db_connect() as db:
+    async with db_connect() as db:
         return await (await db.execute("SELECT * FROM payments WHERE status='pending' ORDER BY id ASC LIMIT ?", (limit,))).fetchall()
 
 async def decide_payment(payment_id: int, approve: bool) -> Optional[aiosqlite.Row]:
-    async with await db_connect() as db:
+    async with db_connect() as db:
         row = await (await db.execute("SELECT * FROM payments WHERE id=?", (payment_id,))).fetchone()
         if not row or row["status"] != "pending":
             return None
@@ -344,13 +353,13 @@ async def decide_payment(payment_id: int, approve: bool) -> Optional[aiosqlite.R
         return row
 
 async def wallet_add(user_id: int, amount: float):
-    async with await db_connect() as db:
+    async with db_connect() as db:
         await db.execute("INSERT OR IGNORE INTO wallets(user_id, balance, total_earned) VALUES (?,0,0)", (user_id,))
         await db.execute("UPDATE wallets SET balance = balance + ?, total_earned = total_earned + ? WHERE user_id=?", (amount, amount, user_id))
         await db.commit()
 
 async def wallet_sub(user_id: int, amount: float) -> bool:
-    async with await db_connect() as db:
+    async with db_connect() as db:
         w = await (await db.execute("SELECT balance FROM wallets WHERE user_id=?", (user_id,))).fetchone()
         bal = float(w["balance"]) if w else 0.0
         if bal + 1e-9 < amount:
@@ -360,7 +369,7 @@ async def wallet_sub(user_id: int, amount: float) -> bool:
         return True
 
 async def apply_ref_earnings(payment_id: int, buyer_id: int, base_amount: float):
-    async with await db_connect() as db:
+    async with db_connect() as db:
         u = await (await db.execute("SELECT ref1, ref2 FROM users WHERE user_id=?", (buyer_id,))).fetchone()
         if not u:
             return
@@ -387,7 +396,7 @@ async def apply_ref_earnings(payment_id: int, buyer_id: int, base_amount: float)
             await wallet_add(int(ref2), a2)
 
 async def progress_done(user_id: int, module_id: int, lesson_id: int):
-    async with await db_connect() as db:
+    async with db_connect() as db:
         await db.execute(
             "INSERT INTO progress(user_id, module_id, lesson_id, done, updated_at) VALUES (?,?,?,?,?) "
             "ON CONFLICT(user_id, module_id, lesson_id) DO UPDATE SET done=1, updated_at=excluded.updated_at",
@@ -397,7 +406,7 @@ async def progress_done(user_id: int, module_id: int, lesson_id: int):
 
 # ---------- Payouts ----------
 async def create_payout(user_id: int, amount: float, details: str) -> int:
-    async with await db_connect() as db:
+    async with db_connect() as db:
         cur = await db.execute(
             "INSERT INTO payouts(user_id, amount, details, status, created_at, decided_at) VALUES (?,?,?,?,?,?)",
             (user_id, amount, details, "pending", now_iso(), None)
@@ -406,11 +415,11 @@ async def create_payout(user_id: int, amount: float, details: str) -> int:
         return int(cur.lastrowid)
 
 async def list_pending_payouts(limit: int = 10):
-    async with await db_connect() as db:
+    async with db_connect() as db:
         return await (await db.execute("SELECT * FROM payouts WHERE status='pending' ORDER BY id ASC LIMIT ?", (limit,))).fetchall()
 
 async def decide_payout(payout_id: int, approve: bool) -> Optional[aiosqlite.Row]:
-    async with await db_connect() as db:
+    async with db_connect() as db:
         row = await (await db.execute("SELECT * FROM payouts WHERE id=?", (payout_id,))).fetchone()
         if not row or row["status"] != "pending":
             return None
@@ -881,7 +890,7 @@ async def cb_adm_actions(call: CallbackQuery, state: FSMContext):
         return
 
     if action == "users":
-        async with await db_connect() as db:
+        async with db_connect() as db:
             rows = await (await db.execute(
                 "SELECT user_id, username, access, created_at FROM users ORDER BY created_at DESC LIMIT 30"
             )).fetchall()
@@ -961,7 +970,7 @@ async def admin_broadcast(message: Message, state: FSMContext):
         await message.answer("Слишком короткий текст.")
         return
 
-    async with await db_connect() as db:
+    async with db_connect() as db:
         rows = await (await db.execute("SELECT user_id FROM users")).fetchall()
     user_ids = [int(r["user_id"]) for r in rows]
 
