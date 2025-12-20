@@ -20,6 +20,7 @@ from decimal import Decimal, ROUND_DOWN
 
 import aiohttp
 import aiosqlite
+from aiogram.client.default import DefaultBotProperties
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart, Command
@@ -682,7 +683,7 @@ async def show_training(target: Message | CallbackQuery, edit: bool = False):
         except Exception:
             pass
 
-    await msg.answer(text, reply_markup=kb, reply_markup_extra=main_kb() if False else None)
+    await msg.answer(text, reply_markup=kb)
 
 
 async def show_earn(target: Message | CallbackQuery, edit: bool = False):
@@ -1388,7 +1389,10 @@ async def fallback(message: Message):
 # ---------------------------------------------------------------------------
 
 async def main():
-    bot = Bot(BOT_TOKEN, parse_mode=ParseMode.HTML)
+    bot = Bot(
+    BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
     dp = Dispatcher()
     dp.include_router(router)
 
