@@ -1404,22 +1404,26 @@ async def fallback(message: Message):
 # START
 # ---------------------------------------------------------------------------
 
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiohttp import ClientTimeout
+
 async def main():
+    session = AiohttpSession(timeout=ClientTimeout(total=60))
     bot = Bot(
-    BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
-)
+        BOT_TOKEN,
+        session=session,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+    )
     dp = Dispatcher()
     dp.include_router(router)
 
     await init_db()
 
-    me = await bot.get_me()
-    global BOT_USERNAME_CACHE
-    BOT_USERNAME_CACHE = me.username
-    logger.info("Bot started as @%s", BOT_USERNAME_CACHE)
+    # важно: если где-то был webhook/старые настройки
+    await bot.delete_webhook(drop_pending_updates=True)
 
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+
 
 
 if __name__ == "__main__":
