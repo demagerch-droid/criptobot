@@ -12,6 +12,10 @@ Traffic Partner Bot (УБД/перелив трафика) — AIogram 3 + aiosq
 
 import asyncio
 import logging
+import asyncio
+import logging
+import random
+import os
 import random
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -55,7 +59,13 @@ PRIVATE_CHANNEL_URL = "https://t.me/your_private_channel_or_invite_link"
 COMMUNITY_GROUP_URL = "https://t.me/your_group_or_forum_link"
 SUPPORT_CONTACT = "@your_support_username"
 
-DB_PATH = "database.db"
+# если есть Volume — используем /data, иначе (локально) — папку проекта
+DB_DIR = "/data" if os.path.isdir("/data") else os.path.dirname(os.path.abspath(__file__))
+os.makedirs(DB_DIR, exist_ok=True)
+
+DB_PATH = os.path.join(DB_DIR, "database.db")
+print("DB_PATH =", DB_PATH)
+
 
 # Антиспам (сек)
 ANTISPAM_SECONDS = 1.2
