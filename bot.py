@@ -1404,25 +1404,29 @@ async def fallback(message: Message):
 # START
 # ---------------------------------------------------------------------------
 
+
 from aiogram.client.session.aiohttp import AiohttpSession
-from aiohttp import ClientTimeout
 
 async def main():
-    session = AiohttpSession(timeout=ClientTimeout(total=60))
+    session = AiohttpSession(timeout=60)  # <-- ВАЖНО: число, не ClientTimeout
     bot = Bot(
         BOT_TOKEN,
         session=session,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML)
     )
+
     dp = Dispatcher()
     dp.include_router(router)
 
     await init_db()
-
-    # важно: если где-то был webhook/старые настройки
     await bot.delete_webhook(drop_pending_updates=True)
 
-    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    await dp.start_polling(
+        bot,
+        allowed_updates=dp.resolve_used_update_types(),
+        polling_timeout=30,     # можно оставить
+        request_timeout=65      # чуть больше, чем polling_timeout
+    )
 
 
 
