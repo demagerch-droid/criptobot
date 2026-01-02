@@ -110,46 +110,109 @@ logger = logging.getLogger("traffic_bot")
 # DB
 # ---------------------------------------------------------------------------
 
-@asynccontextmanager
-async def get_db():
-    db = await aiosqlite.connect(DB_PATH, timeout=30)
-    db.row_factory = aiosqlite.Row
-    await db.execute("PRAGMA journal_mode=WAL;")
-    await db.execute("PRAGMA foreign_keys=ON;")
-    await db.execute("PRAGMA busy_timeout=30000;")
-    try:
-        yield db
-    finally:
-        await db.close()
-
-
 async def init_db():
     async with get_db() as db:
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                tg_id INTEGER UNIQUE NOT NULL,
-                username TEXT DEFAULT '',
-                first_name TEXT DEFAULT '',
-                referrer_id INTEGER,
-                reg_date TEXT,
-                full_access INTEGER DEFAULT 0,
-                balance TEXT DEFAULT '0',
-                total_earned TEXT DEFAULT '0',
-                is_blocked INTEGER DEFAULT 0,
-                FOREIGN KEY(referrer_id) REFERENCES users(id)
-            );
-            """
-        )
+        # --- проверяем существующую таблицу users ---
+        cur = await db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='users'")
+        users_exists = await cur.fetchone()
+
+        async def create_users_table():
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tg_id INTEGER UNIQUE NOT NULL,
+                    username TEXT DEFAULT '',
+                    first_name TEXT DEFAULT '',
+                    referrer_id INTEGER,
+                    reg_date TEXT,
+                    full_access INTEGER DEFAULT 0,
+                    balance TEXT DEFAULT '0',
+                    total_earned TEXT DEFAULT '0',
+                    is_blocked INTEGER DEFAULT 0,
+                    FOREIGN KEY(referrer_id) REFERENCES users(id)
+                );
+                """
+            )
+
+        if not users_exists:
+            # БД пустая — просто создаём таблицу
+            await create_users_table()
+        else:
+            # Таблица есть — проверяем колонки
+            cur = await db.execute("PRAGMA table_info(users)")
+            cols = [r["name"] for r in await cur.fetchall()]
+
+            # Если нет колонки id — это старая схема, делаем миграцию
+            if "id" not in cols:
+                logger.warning("DB MIGRATION: old users table without 'id'. Migrating...")
+
+                await db.execute("PRAGMA foreign_keys=OFF;")
+                await db.execute("ALTER TABLE users RENAME TO users_old;")
+
+                # создаём новую правильную таблицу
+                await create_users_table()
+
+                # смотрим, какие колонки были в старой таблице
+                cur = await db.execute("PRAGMA table_info(users_old)")
+                old_cols = {r["name"] for r in await cur.fetchall()}
+
+                # какой столбец в старой таблице был Telegram ID
+                tg_col = next((c for c in ("tg_id", "telegram_id", "user_id") if c in old_cols), None)
+
+                # какой столбец был рефералом (обычно там tg_id реферера)
+                ref_col = next((c for c in ("referrer_id", "referrer_tg_id", "ref_tg_id") if c in old_cols), None)
+
+                def expr(col, default_sql):
+                    return f"COALESCE({col}, {default_sql})" if col in old_cols else default_sql
+
+                if tg_col:
+                    # переносим пользователей (referrer_id пока ставим NULL)
+                    await db.execute(f"""
+                        INSERT INTO users (tg_id, username, first_name, referrer_id, reg_date, full_access, balance, total_earned, is_blocked)
+                        SELECT
+                            {expr(tg_col, "0")},
+                            {expr("username", "''")},
+                            {expr("first_name", "''")},
+                            NULL,
+                            {expr("reg_date", "''")},
+                            {expr("full_access", "0")},
+                            {expr("balance", "'0'")},
+                            {expr("total_earned", "'0'")},
+                            {expr("is_blocked", "0")}
+                        FROM users_old;
+                    """)
+
+                    # восстанавливаем referrer_id, если в старой таблице он был (обычно как tg_id)
+                    if ref_col:
+                        await db.execute(f"""
+                            UPDATE users
+                            SET referrer_id = (
+                                SELECT u2.id FROM users u2
+                                WHERE u2.tg_id = (
+                                    SELECT o.{ref_col} FROM users_old o WHERE o.{tg_col} = users.tg_id
+                                )
+                            )
+                            WHERE (
+                                SELECT o.{ref_col} FROM users_old o WHERE o.{tg_col} = users.tg_id
+                            ) IS NOT NULL;
+                        """)
+                else:
+                    logger.error("DB MIGRATION: can't find tg_id column in users_old, recreating empty users table.")
+
+                await db.execute("DROP TABLE users_old;")
+                await db.execute("PRAGMA foreign_keys=ON;")
+                await db.commit()
+
+        # --- остальные таблицы как было ---
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS purchases (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
-                product_code TEXT NOT NULL,         -- "access"
-                amount TEXT NOT NULL,               -- Decimal as string (важно!)
-                status TEXT NOT NULL,               -- "pending" / "paid"
+                product_code TEXT NOT NULL,
+                amount TEXT NOT NULL,
+                status TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 paid_at TEXT,
                 tx_id TEXT,
@@ -158,6 +221,7 @@ async def init_db():
             );
             """
         )
+
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS progress (
@@ -168,7 +232,9 @@ async def init_db():
             );
             """
         )
+
         await db.commit()
+
 
 
 async def get_user_by_tg(tg_id: int):
