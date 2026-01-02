@@ -1,31 +1,20 @@
 # -*- coding: utf-8 -*-
-"""
-Traffic Partner Bot (УБД/перелив трафика) — AIogram 3 + aiosqlite
-Логика:
-- Постоянное нижнее меню (ReplyKeyboard): 🧠 Обучение / 💸 Заработок / 👤 Профиль
-- Оплата полного доступа (USDT TRC20) через TronGrid с "хвостиком" суммы
-- Доступ "навсегда" (без подписки)
-- 8 модулей обучения: структура видна всем, но модули "закрыты" до оплаты
-- Партнёрка 2 уровня: 50% (1 линия) + 10% (2 линия) от базовой цены (без хвостика)
-- Админ-панель доступна только ADMIN_ID
-"""
 
-import asyncio
-import logging
+
 import asyncio
 import logging
 import random
 import os
-import random
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_DOWN
 
 import aiohttp
 import aiosqlite
-from aiogram.client.default import DefaultBotProperties
+
 from aiogram import Bot, Dispatcher, Router, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
@@ -38,37 +27,40 @@ from aiogram.types import (
 )
 
 # ---------------------------------------------------------------------------
-# НАСТРОЙКИ (всё в коде — как ты просил) 
+# НАСТРОЙКИ
+# Лучше хранить токен в переменных окружения (Railway Variables), но оставил fallback.
 # ---------------------------------------------------------------------------
 
-BOT_TOKEN = "8491759417:AAFCnK5ubsubVQPYvdOTp6p0MRJrtA4m5p8"  # ⚠️ лучше вставить новый токен (перевыпусти в BotFather)
-ADMIN_ID = 8585550939  # твой TG ID (числом)
+BOT_TOKEN = os.getenv("BOT_TOKEN", "PASTE_BOT_TOKEN_HERE")  # поставь в Railway Variables
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))                 # поставь в Railway Variables (числом)
 
 # TronGrid / TRC20 (USDT)
-TRONGRID_API_KEY = "PASTE_TRONGRID_KEY_HERE"
-WALLET_ADDRESS = "PASTE_YOUR_TRON_WALLET_HERE"  # адрес получателя USDT TRC20 (T...)
+TRONGRID_API_KEY = os.getenv("TRONGRID_API_KEY", "")       # можно пустым
+WALLET_ADDRESS = os.getenv("WALLET_ADDRESS", "")           # адрес получателя USDT TRC20 (T...)
 USDT_TRON_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"  # стандартный контракт USDT TRC20
 
 # Цена доступа
-PRICE_ACCESS = Decimal("200")  # $200
-LEVEL1_PERCENT = Decimal("0.50")  # 50%
-LEVEL2_PERCENT = Decimal("0.10")  # 10%
+PRICE_ACCESS = Decimal(os.getenv("PRICE_ACCESS", "200"))   # $200
+LEVEL1_PERCENT = Decimal(os.getenv("LEVEL1_PERCENT", "0.50"))
+LEVEL2_PERCENT = Decimal(os.getenv("LEVEL2_PERCENT", "0.10"))
 
 # Куда вести после оплаты
-PRIVATE_CHANNEL_URL = "https://t.me/your_private_channel_or_invite_link"
-COMMUNITY_GROUP_URL = "https://t.me/your_group_or_forum_link"
-SUPPORT_CONTACT = "@your_support_username"
+PRIVATE_CHANNEL_URL = os.getenv("PRIVATE_CHANNEL_URL", "https://t.me/your_private_channel_or_invite_link")
+COMMUNITY_GROUP_URL = os.getenv("COMMUNITY_GROUP_URL", "https://t.me/your_group_or_forum_link")
+SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT", "@your_support_username")
 
-# если есть Volume — используем /data, иначе (локально) — папку проекта
+# Антиспам (сек)
+ANTISPAM_SECONDS = float(os.getenv("ANTISPAM_SECONDS", "1.2"))
+
+# ---------------------------------------------------------------------------
+# DB PATH (Railway Volume: /data)
+# ---------------------------------------------------------------------------
+
 DB_DIR = "/data" if os.path.isdir("/data") else os.path.dirname(os.path.abspath(__file__))
 os.makedirs(DB_DIR, exist_ok=True)
 
 DB_PATH = os.path.join(DB_DIR, "database.db")
 print("DB_PATH =", DB_PATH)
-
-
-# Антиспам (сек)
-ANTISPAM_SECONDS = 1.2
 
 # ---------------------------------------------------------------------------
 # ОФОРМЛЕНИЕ / ТЕКСТЫ / МОДУЛИ
@@ -88,15 +80,13 @@ MODULES = [
     "8️⃣ Модуль 8 — Партнёрка: как строить сеть и удержание",
 ]
 
-# Контент модулей — ты потом заменишь текст внутри
 MODULE_TEXT_PLACEHOLDER = (
     "📝 <b>Здесь будет текст модуля</b>\n\n"
     "Ты можешь вставить сюда свой контент, чек-листы, ссылки, примеры связок и т.д.\n"
     "Чтобы было красиво — делай:\n"
     "• короткие блоки\n"
     "• списки\n"
-    "• выделение жирным\n\n"
-    "Если хочешь — я помогу красиво оформить каждый модуль."
+    "• выделение жирным\n"
 )
 
 # ---------------------------------------------------------------------------
@@ -107,12 +97,33 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("traffic_bot")
 
 # ---------------------------------------------------------------------------
-# DB
+# DB HELPERS
 # ---------------------------------------------------------------------------
 
+@asynccontextmanager
+async def get_db():
+    """
+    Единый способ открыть БД.
+    Важно: row_factory включен, чтобы row["id"] работало.
+    """
+    db = await aiosqlite.connect(DB_PATH, timeout=30)
+    db.row_factory = aiosqlite.Row
+    # WAL обычно ок, но если увидишь "database is locked" — поменяй на DELETE
+    await db.execute("PRAGMA journal_mode=WAL;")
+    await db.execute("PRAGMA foreign_keys=ON;")
+    await db.execute("PRAGMA busy_timeout=30000;")
+    try:
+        yield db
+    finally:
+        await db.close()
+
+
 async def init_db():
+    """
+    Создание/миграция схемы.
+    Чинит старую таблицу users без колонки id.
+    """
     async with get_db() as db:
-        # --- проверяем существующую таблицу users ---
         cur = await db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='users'")
         users_exists = await cur.fetchone()
 
@@ -136,38 +147,28 @@ async def init_db():
             )
 
         if not users_exists:
-            # БД пустая — просто создаём таблицу
             await create_users_table()
         else:
-            # Таблица есть — проверяем колонки
             cur = await db.execute("PRAGMA table_info(users)")
             cols = [r["name"] for r in await cur.fetchall()]
 
-            # Если нет колонки id — это старая схема, делаем миграцию
             if "id" not in cols:
                 logger.warning("DB MIGRATION: old users table without 'id'. Migrating...")
 
                 await db.execute("PRAGMA foreign_keys=OFF;")
                 await db.execute("ALTER TABLE users RENAME TO users_old;")
-
-                # создаём новую правильную таблицу
                 await create_users_table()
 
-                # смотрим, какие колонки были в старой таблице
                 cur = await db.execute("PRAGMA table_info(users_old)")
                 old_cols = {r["name"] for r in await cur.fetchall()}
 
-                # какой столбец в старой таблице был Telegram ID
                 tg_col = next((c for c in ("tg_id", "telegram_id", "user_id") if c in old_cols), None)
-
-                # какой столбец был рефералом (обычно там tg_id реферера)
                 ref_col = next((c for c in ("referrer_id", "referrer_tg_id", "ref_tg_id") if c in old_cols), None)
 
                 def expr(col, default_sql):
                     return f"COALESCE({col}, {default_sql})" if col in old_cols else default_sql
 
                 if tg_col:
-                    # переносим пользователей (referrer_id пока ставим NULL)
                     await db.execute(f"""
                         INSERT INTO users (tg_id, username, first_name, referrer_id, reg_date, full_access, balance, total_earned, is_blocked)
                         SELECT
@@ -183,7 +184,6 @@ async def init_db():
                         FROM users_old;
                     """)
 
-                    # восстанавливаем referrer_id, если в старой таблице он был (обычно как tg_id)
                     if ref_col:
                         await db.execute(f"""
                             UPDATE users
@@ -204,7 +204,6 @@ async def init_db():
                 await db.execute("PRAGMA foreign_keys=ON;")
                 await db.commit()
 
-        # --- остальные таблицы как было ---
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS purchases (
@@ -235,7 +234,9 @@ async def init_db():
 
         await db.commit()
 
-
+# ---------------------------------------------------------------------------
+# USERS
+# ---------------------------------------------------------------------------
 
 async def get_user_by_tg(tg_id: int):
     async with get_db() as db:
@@ -432,9 +433,7 @@ async def mark_purchase_paid(purchase_id: int, tx_id: str):
     paid_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     async with get_db() as db:
         await db.execute(
-            """
-            UPDATE purchases SET status='paid', paid_at=?, tx_id=? WHERE id=?
-            """,
+            "UPDATE purchases SET status='paid', paid_at=?, tx_id=? WHERE id=?",
             (paid_at, tx_id, purchase_id),
         )
         await db.commit()
@@ -448,9 +447,6 @@ async def get_tg_id_by_user_db(user_db_id: int) -> int | None:
 
 
 async def process_successful_payment(bot: Bot, purchase_row):
-    """
-    Начисляет доступ и партнёрку (50% + 10%) с базовой цены (без хвоста).
-    """
     purchase_id = int(purchase_row["id"])
     user_db_id = int(purchase_row["user_id"])
     product_code = purchase_row["product_code"]
@@ -458,10 +454,8 @@ async def process_successful_payment(bot: Bot, purchase_row):
     if product_code != "access":
         return
 
-    # 1) открыть доступ
     await set_full_access(user_db_id, True)
 
-    # 2) партнёрка
     lvl1, lvl2 = await get_referrer_chain(user_db_id)
     base = PRICE_ACCESS
 
@@ -475,8 +469,8 @@ async def process_successful_payment(bot: Bot, purchase_row):
             try:
                 await bot.send_message(
                     tg_id_1,
-                    f"💰 <b>Начисление партнёрки</b>\n\n"
-                    f"Твой партнёр оплатил доступ.\n"
+                    "💰 <b>Начисление партнёрки</b>\n\n"
+                    "Твой партнёр оплатил доступ.\n"
                     f"Тебе начислено: <b>{lvl1_bonus}$</b> (1 уровень).",
                     reply_markup=main_kb(),
                 )
@@ -490,21 +484,20 @@ async def process_successful_payment(bot: Bot, purchase_row):
             try:
                 await bot.send_message(
                     tg_id_2,
-                    f"💸 <b>Начисление партнёрки</b>\n\n"
-                    f"Покупка прошла во 2-й линии.\n"
+                    "💸 <b>Начисление партнёрки</b>\n\n"
+                    "Покупка прошла во 2-й линии.\n"
                     f"Тебе начислено: <b>{lvl2_bonus}$</b> (2 уровень).",
                     reply_markup=main_kb(),
                 )
             except Exception:
                 pass
 
-    # 3) уведомить покупателя
     buyer_tg_id = await get_tg_id_by_user_db(user_db_id)
     if buyer_tg_id:
         await bot.send_message(
             buyer_tg_id,
             "✅ <b>Оплата подтверждена!</b>\n\n"
-            f"Доступ открыт <b>навсегда</b>.\n\n"
+            "Доступ открыт <b>навсегда</b>.\n\n"
             "Теперь тебе доступны:\n"
             "• все 8 модулей обучения\n"
             "• партнёрская программа 50% + 10%\n"
@@ -515,9 +508,10 @@ async def process_successful_payment(bot: Bot, purchase_row):
 
 
 async def fetch_trc20_transactions() -> list:
-    """
-    TronGrid: последние TRC20 транзакции по нашему кошельку
-    """
+    if not WALLET_ADDRESS:
+        logger.error("WALLET_ADDRESS пустой. В Railway Variables задай WALLET_ADDRESS.")
+        return []
+
     url = f"https://api.trongrid.io/v1/accounts/{WALLET_ADDRESS}/transactions/trc20"
     headers = {"TRON-PRO-API-KEY": TRONGRID_API_KEY} if TRONGRID_API_KEY else {}
     params = {
@@ -536,9 +530,6 @@ async def fetch_trc20_transactions() -> list:
 
 
 async def find_payment_for_amount(amount: Decimal, created_at: datetime) -> str | None:
-    """
-    Ищем транзакцию по точной сумме (с хвостом) и по времени создания заявки.
-    """
     txs = await fetch_trc20_transactions()
     if not txs:
         return None
@@ -555,14 +546,12 @@ async def find_payment_for_amount(amount: Decimal, created_at: datetime) -> str 
             raw_value = Decimal(tx.get("value", "0"))
             value = raw_value / (Decimal(10) ** decimals)
 
-            # допускаем минимальную погрешность
             if abs(value - amount) > Decimal("0.0005"):
                 continue
 
             ts_ms = tx.get("block_timestamp")
             tx_time = datetime.utcfromtimestamp(ts_ms / 1000.0)
 
-            # транзакция не должна быть сильно раньше заявки (например, старше 24 часов)
             if tx_time + timedelta(hours=24) < created_at:
                 continue
 
@@ -572,7 +561,6 @@ async def find_payment_for_amount(amount: Decimal, created_at: datetime) -> str 
             continue
 
     return None
-
 
 # ---------------------------------------------------------------------------
 # UI: клавиатуры
@@ -597,13 +585,12 @@ def kb_back(cb: str) -> InlineKeyboardMarkup:
 
 
 def kb_buy(back_cb: str) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardMarkup(
+    return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text=f"💳 Купить доступ ({PRICE_ACCESS}$)", callback_data="buy_access")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data=back_cb)],
         ]
     )
-    return kb
 
 
 def kb_training(has_access: bool) -> InlineKeyboardMarkup:
@@ -612,7 +599,6 @@ def kb_training(has_access: bool) -> InlineKeyboardMarkup:
         if has_access:
             rows.append([InlineKeyboardButton(text=title, callback_data=f"mod:{idx}")])
         else:
-            # структура видна, но модуль закрыт
             rows.append([InlineKeyboardButton(text=f"🔒 {title}", callback_data=f"locked:{idx}")])
 
     bottom = []
@@ -645,7 +631,7 @@ def kb_earn(has_access: bool) -> InlineKeyboardMarkup:
     )
 
 
-def kb_profile(has_access: bool, is_admin: bool) -> InlineKeyboardMarkup:
+def kb_profile(has_access: bool, is_admin_flag: bool) -> InlineKeyboardMarkup:
     rows = []
     if has_access:
         rows.append([InlineKeyboardButton(text="🔗 Моя реферальная ссылка", callback_data="my_ref")])
@@ -656,7 +642,7 @@ def kb_profile(has_access: bool, is_admin: bool) -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton(text="ℹ️ FAQ", callback_data="faq")])
     rows.append([InlineKeyboardButton(text="💬 Поддержка", callback_data="support")])
 
-    if is_admin:
+    if is_admin_flag:
         rows.append([InlineKeyboardButton(text="🔐 Админ-панель", callback_data="admin_panel")])
 
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -669,7 +655,6 @@ def kb_payment(purchase_id: int, back_cb: str) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="⬅️ Назад", callback_data=back_cb)],
         ]
     )
-
 
 # ---------------------------------------------------------------------------
 # Антиспам
@@ -685,7 +670,6 @@ def is_spam(user_id: int) -> bool:
         return False
     return (now - last).total_seconds() < ANTISPAM_SECONDS
 
-
 # ---------------------------------------------------------------------------
 # Bot / Router
 # ---------------------------------------------------------------------------
@@ -693,10 +677,8 @@ def is_spam(user_id: int) -> bool:
 router = Router()
 BOT_USERNAME_CACHE: str | None = None
 
-
 def is_admin(tg_id: int) -> bool:
     return tg_id == ADMIN_ID
-
 
 # ---------------------------------------------------------------------------
 # Основные экраны
@@ -745,10 +727,7 @@ async def show_training(target: Message | CallbackQuery, edit: bool = False):
             "• партнёрка 50% + 10% включается сразу после оплаты\n"
         )
     else:
-        text += (
-            "\n✅ <b>Доступ открыт</b>\n"
-            "Теперь ты можешь открывать модули + перейти в закрытый канал и группу."
-        )
+        text += "\n✅ <b>Доступ открыт</b>\nТеперь ты можешь открывать модули + перейти в закрытый канал и группу."
 
     kb = kb_training(has)
 
@@ -776,8 +755,8 @@ async def show_earn(target: Message | CallbackQuery, edit: bool = False):
         text = (
             "💸 <b>Заработок</b>\n\n"
             "У нас простая партнёрка на 2 уровня:\n"
-            f"• <b>50%</b> с 1-й линии\n"
-            f"• <b>10%</b> со 2-й линии\n\n"
+            "• <b>50%</b> с 1-й линии\n"
+            "• <b>10%</b> со 2-й линии\n\n"
             "⚠️ Но реферальная ссылка и статистика открываются только после покупки полного доступа.\n\n"
             "Хочешь зарабатывать — открой доступ и получи свою реф-ссылку."
         )
@@ -814,7 +793,6 @@ async def show_profile(target: Message | CallbackQuery, edit: bool = False):
 
     row = await get_user_by_tg(tg_id)
     if not row:
-        # на всякий случай
         await get_or_create_user(target.from_user if isinstance(target, Message) else target.from_user, None)
         row = await get_user_by_tg(tg_id)
 
@@ -855,7 +833,6 @@ async def show_profile(target: Message | CallbackQuery, edit: bool = False):
 
     await msg.answer(text, reply_markup=kb)
 
-
 # ---------------------------------------------------------------------------
 # /start
 # ---------------------------------------------------------------------------
@@ -876,9 +853,8 @@ async def cmd_start(message: Message):
     await get_or_create_user(message.from_user, ref_tg_id)
     await show_home(message)
 
-
 # ---------------------------------------------------------------------------
-# Нижнее меню (ReplyKeyboard)
+# Нижнее меню
 # ---------------------------------------------------------------------------
 
 @router.message(F.text == "🧠 Обучение")
@@ -887,13 +863,11 @@ async def menu_training(message: Message):
         return
     await show_training(message)
 
-
 @router.message(F.text == "💸 Заработок")
 async def menu_earn(message: Message):
     if is_spam(message.from_user.id):
         return
     await show_earn(message)
-
 
 @router.message(F.text == "👤 Профиль")
 async def menu_profile(message: Message):
@@ -901,15 +875,13 @@ async def menu_profile(message: Message):
         return
     await show_profile(message)
 
-
 # ---------------------------------------------------------------------------
-# Обучение: модули (lock/open)
+# Обучение: модули
 # ---------------------------------------------------------------------------
 
 @router.callback_query(F.data.startswith("locked:"))
 async def cb_locked_module(call: CallbackQuery):
     await call.answer("🔒 Модуль закрыт. Сначала оплати доступ.", show_alert=True)
-
 
 @router.callback_query(F.data.startswith("mod:"))
 async def cb_open_module(call: CallbackQuery):
@@ -931,9 +903,7 @@ async def cb_open_module(call: CallbackQuery):
         await call.message.edit_text(text, reply_markup=kb_training(True))
     except Exception:
         await call.message.answer(text, reply_markup=kb_training(True))
-
     await call.answer()
-
 
 # ---------------------------------------------------------------------------
 # Заработок: инфо / реф / статистика / топ
@@ -948,8 +918,8 @@ async def cb_earn_info(call: CallbackQuery):
         "• статистику по партнёрам\n"
         "• начисления на баланс\n\n"
         "💰 Начисления:\n"
-        f"• <b>50%</b> с 1-й линии\n"
-        f"• <b>10%</b> со 2-й линии\n\n"
+        "• <b>50%</b> с 1-й линии\n"
+        "• <b>10%</b> со 2-й линии\n\n"
         "⚠️ Начисления идут только с покупки полного доступа."
     )
     kb = InlineKeyboardMarkup(
@@ -964,14 +934,10 @@ async def cb_earn_info(call: CallbackQuery):
         await call.message.answer(text, reply_markup=kb)
     await call.answer()
 
-
 @router.callback_query(F.data == "my_ref")
 async def cb_my_ref(call: CallbackQuery):
     if not await has_access_by_tg(call.from_user.id):
-        text = (
-            "🔗 <b>Реферальная ссылка</b>\n\n"
-            "Сначала открой полный доступ — и здесь появится твоя реф-ссылка + статистика."
-        )
+        text = "🔗 <b>Реферальная ссылка</b>\n\nСначала открой полный доступ — и здесь появится твоя реф-ссылка + статистика."
         try:
             await call.message.edit_text(text, reply_markup=kb_buy("back:profile"))
         except Exception:
@@ -1007,7 +973,6 @@ async def cb_my_ref(call: CallbackQuery):
         await call.message.answer(text, reply_markup=kb)
     await call.answer()
 
-
 @router.callback_query(F.data == "my_stats")
 async def cb_my_stats(call: CallbackQuery):
     row = await get_user_by_tg(call.from_user.id)
@@ -1030,7 +995,6 @@ async def cb_my_stats(call: CallbackQuery):
         f"💰 Баланс к выводу: <b>{balance.quantize(Decimal('0.01'))}$</b>\n"
         f"🏦 Всего заработано: <b>{total_earned.quantize(Decimal('0.01'))}$</b>"
     )
-
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🔗 Моя реферальная ссылка", callback_data="my_ref")],
@@ -1043,7 +1007,6 @@ async def cb_my_stats(call: CallbackQuery):
     except Exception:
         await call.message.answer(text, reply_markup=kb)
     await call.answer()
-
 
 @router.callback_query(F.data == "top_refs")
 async def cb_top_refs(call: CallbackQuery):
@@ -1069,7 +1032,6 @@ async def cb_top_refs(call: CallbackQuery):
         await call.message.answer(text, reply_markup=kb)
     await call.answer()
 
-
 @router.callback_query(F.data == "withdraw")
 async def cb_withdraw(call: CallbackQuery):
     row = await get_user_by_tg(call.from_user.id)
@@ -1087,8 +1049,7 @@ async def cb_withdraw(call: CallbackQuery):
         f"Твой текущий баланс: <b>{balance.quantize(Decimal('0.01'))}$</b>\n\n"
         "Чтобы запросить вывод, напиши администратору в поддержку и укажи:\n"
         "• сумму\n"
-        "• твой USDT-адрес (TRC20)\n"
-        "• скрин/ID профиля (если нужно)\n\n"
+        "• твой USDT-адрес (TRC20)\n\n"
         f"Поддержка: {SUPPORT_CONTACT}"
     )
     try:
@@ -1096,11 +1057,10 @@ async def cb_withdraw(call: CallbackQuery):
     except Exception:
         await call.message.answer(text, reply_markup=kb_back("back:earn"))
 
-    # можно тихо уведомить админа (не обязательно)
     try:
         await call.bot.send_message(
             ADMIN_ID,
-            f"📥 <b>Запрос вывода</b>\n"
+            "📥 <b>Запрос вывода</b>\n"
             f"От: <code>{call.from_user.id}</code>\n"
             f"Username: @{call.from_user.username or '—'}\n"
             f"Баланс: {balance}$",
@@ -1110,9 +1070,8 @@ async def cb_withdraw(call: CallbackQuery):
 
     await call.answer()
 
-
 # ---------------------------------------------------------------------------
-# Profile: FAQ / Support
+# FAQ / Support
 # ---------------------------------------------------------------------------
 
 @router.callback_query(F.data == "faq")
@@ -1138,7 +1097,6 @@ async def cb_faq(call: CallbackQuery):
         await call.message.answer(text, reply_markup=kb_back("back:profile"))
     await call.answer()
 
-
 @router.callback_query(F.data == "support")
 async def cb_support(call: CallbackQuery):
     text = (
@@ -1155,14 +1113,12 @@ async def cb_support(call: CallbackQuery):
         await call.message.answer(text, reply_markup=kb_back("back:profile"))
     await call.answer()
 
-
 # ---------------------------------------------------------------------------
 # Покупка доступа / Проверка оплаты
 # ---------------------------------------------------------------------------
 
 @router.callback_query(F.data == "buy_access")
 async def cb_buy_access(call: CallbackQuery):
-    # если уже есть доступ — не показываем оплату
     if await has_access_by_tg(call.from_user.id):
         await call.answer("✅ У тебя уже открыт доступ.", show_alert=True)
         return
@@ -1180,13 +1136,12 @@ async def cb_buy_access(call: CallbackQuery):
     text = (
         f"💳 <b>Оплата доступа ({PRICE_ACCESS}$)</b>\n\n"
         "Оплата в <b>USDT (TRC20)</b>.\n\n"
-        f"Кошелёк для оплаты:\n<code>{WALLET_ADDRESS}</code>\n\n"
+        f"Кошелёк для оплаты:\n<code>{WALLET_ADDRESS or '— не задан —'}</code>\n\n"
         f"Сумма к оплате: <b>{amount} USDT</b>\n\n"
         "⚠️ Важно: отправь <b>ТОЧНО</b> эту сумму (с хвостиком), иначе бот не сопоставит платёж.\n\n"
         "После оплаты нажми «Проверить оплату»."
     )
 
-    # куда возвращаться: обучение (чаще всего человек там)
     kb = kb_payment(purchase_id, back_cb="back:training")
 
     try:
@@ -1195,7 +1150,6 @@ async def cb_buy_access(call: CallbackQuery):
         await call.message.answer(text, reply_markup=kb)
 
     await call.answer()
-
 
 @router.callback_query(F.data.startswith("check_pay:"))
 async def cb_check_pay(call: CallbackQuery):
@@ -1210,7 +1164,6 @@ async def cb_check_pay(call: CallbackQuery):
         await call.answer("Оплата не найдена. Попробуй заново.", show_alert=True)
         return
 
-    # безопасность: проверяем что это покупка этого пользователя
     user_row = await get_user_by_tg(call.from_user.id)
     if not user_row or int(user_row["id"]) != int(purchase["user_id"]):
         await call.answer("Эта оплата не принадлежит тебе.", show_alert=True)
@@ -1245,12 +1198,10 @@ async def cb_check_pay(call: CallbackQuery):
     purchase2 = await get_purchase(purchase_id)
     await process_successful_payment(call.bot, purchase2)
 
-    # после оплаты — показываем обучение (уже открыто)
     try:
         await show_training(call, edit=True)
     except Exception:
         pass
-
 
 # ---------------------------------------------------------------------------
 # Back navigation callbacks
@@ -1269,33 +1220,9 @@ async def cb_back(call: CallbackQuery):
         await show_home(call.message)
     await call.answer()
 
-
 # ---------------------------------------------------------------------------
-# Admin panel
+# Admin panel (минимальный)
 # ---------------------------------------------------------------------------
-
-@router.message(Command("admin"))
-async def cmd_admin(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-
-    text = (
-        "🔐 <b>Админ-панель</b>\n\n"
-        "Команды:\n"
-        "• <code>/grant 123456789</code> — выдать доступ по TG ID\n"
-        "• <code>/grant @username</code> — выдать доступ по username\n"
-        "• <code>/user 123456789</code> — инфо по пользователю\n"
-        "• <code>/stats</code> — общая статистика\n\n"
-        "Также есть кнопки ниже 👇"
-    )
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="👥 Пользователи (последние 20)", callback_data="admin_users")],
-            [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
-        ]
-    )
-    await message.answer(text, reply_markup=kb)
-
 
 async def _find_user_by_identifier(identifier: str):
     identifier = identifier.strip()
@@ -1304,161 +1231,27 @@ async def _find_user_by_identifier(identifier: str):
             username = identifier[1:]
             cur = await db.execute("SELECT * FROM users WHERE username = ?", (username,))
             return await cur.fetchone()
-        else:
-            try:
-                tg_id = int(identifier)
-            except Exception:
-                return None
-            cur = await db.execute("SELECT * FROM users WHERE tg_id = ?", (tg_id,))
-            return await cur.fetchone()
-
+        try:
+            tg_id = int(identifier)
+        except Exception:
+            return None
+        cur = await db.execute("SELECT * FROM users WHERE tg_id = ?", (tg_id,))
+        return await cur.fetchone()
 
 @router.message(Command("grant"))
 async def cmd_grant(message: Message):
     if not is_admin(message.from_user.id):
         return
-
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2:
         await message.answer("Использование: <code>/grant 123456789</code> или <code>/grant @username</code>")
         return
-
-    ident = parts[1].strip()
-    user = await _find_user_by_identifier(ident)
+    user = await _find_user_by_identifier(parts[1])
     if not user:
         await message.answer("Пользователь не найден в базе. Пусть сначала нажмёт /start.")
         return
-
     await set_full_access(int(user["id"]), True)
     await message.answer("✅ Доступ выдан.")
-    try:
-        await message.bot.send_message(
-            int(user["tg_id"]),
-            "🎟 <b>Тебе выдан доступ администратором.</b>\n\n"
-            "Теперь все модули открыты + партнёрка активна.",
-            reply_markup=main_kb(),
-        )
-    except Exception:
-        pass
-
-
-@router.message(Command("user"))
-async def cmd_user(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-
-    parts = (message.text or "").split(maxsplit=1)
-    if len(parts) < 2:
-        await message.answer("Использование: <code>/user 123456789</code> или <code>/user @username</code>")
-        return
-
-    user = await _find_user_by_identifier(parts[1])
-    if not user:
-        await message.answer("Пользователь не найден.")
-        return
-
-    user_db_id = int(user["id"])
-    lvl1, lvl2 = await count_referrals(user_db_id)
-
-    text = (
-        "👤 <b>Пользователь</b>\n\n"
-        f"TG ID: <code>{user['tg_id']}</code>\n"
-        f"Username: @{user['username'] or '—'}\n"
-        f"Имя: {user['first_name'] or '—'}\n"
-        f"Регистрация: {user['reg_date'] or '—'}\n\n"
-        f"Доступ: {'да ✅' if user['full_access'] else 'нет ❌'}\n"
-        f"Рефы: 1л={lvl1}, 2л={lvl2}\n"
-        f"Баланс: {user['balance']}$\n"
-        f"Всего заработано: {user['total_earned']}$"
-    )
-    await message.answer(text)
-
-
-async def build_admin_stats_text() -> str:
-    async with get_db() as db:
-        cur_u = await db.execute("SELECT COUNT(*) AS c FROM users")
-        users_cnt = (await cur_u.fetchone())["c"]
-
-        cur_p = await db.execute("SELECT COUNT(*) AS c FROM purchases WHERE status='paid'")
-        paid_cnt = (await cur_p.fetchone())["c"]
-
-        cur_rev = await db.execute("SELECT amount FROM purchases WHERE status='paid' AND product_code='access'")
-        rows = await cur_rev.fetchall()
-        revenue = sum([Decimal(r["amount"]) for r in rows], Decimal("0"))
-
-    text = (
-        "📊 <b>Статистика</b>\n\n"
-        f"👥 Пользователей: <b>{users_cnt}</b>\n"
-        f"✅ Оплаченных доступов: <b>{paid_cnt}</b>\n"
-        f"💵 Сумма оплат (с хвостами): <b>{revenue.quantize(Decimal('0.001'))} USDT</b>\n"
-    )
-    return text
-
-
-@router.message(Command("stats"))
-async def cmd_stats(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-
-    text = await build_admin_stats_text()
-    await message.answer(text)
-
-
-@router.callback_query(F.data == "admin_users")
-async def cb_admin_users(call: CallbackQuery):
-    if not is_admin(call.from_user.id):
-        await call.answer("Нет доступа", show_alert=True)
-        return
-
-    async with get_db() as db:
-        cur = await db.execute(
-            "SELECT tg_id, username, first_name, reg_date, full_access FROM users ORDER BY id DESC LIMIT 20"
-        )
-        rows = await cur.fetchall()
-
-    lines = ["👥 <b>Последние 20 пользователей</b>\n"]
-    for r in rows:
-        name = f"@{r['username']}" if r["username"] else (r["first_name"] or "—")
-        lines.append(f"• {name} — <code>{r['tg_id']}</code> — {'✅' if r['full_access'] else '❌'}")
-    text = "\n".join(lines)
-
-    try:
-        await call.message.edit_text(text, reply_markup=kb_back("back:profile"))
-    except Exception:
-        await call.message.answer(text, reply_markup=kb_back("back:profile"))
-    await call.answer()
-
-
-@router.callback_query(F.data == "admin_stats")
-async def cb_admin_stats(call: CallbackQuery):
-    if not is_admin(call.from_user.id):
-        await call.answer("Нет доступа", show_alert=True)
-        return
-
-    text = await build_admin_stats_text()
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="👥 Пользователи (последние 20)", callback_data="admin_users")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="back:profile")],
-        ]
-    )
-
-    try:
-        await call.message.edit_text(text, reply_markup=kb)
-    except Exception:
-        await call.message.answer(text, reply_markup=kb)
-
-    await call.answer()
-
-
-@router.callback_query(F.data == "admin_panel")
-async def cb_admin_panel(call: CallbackQuery):
-    if not is_admin(call.from_user.id):
-        await call.answer("Нет доступа", show_alert=True)
-        return
-    await call.message.answer("Открой /admin — там команды и кнопки.", reply_markup=main_kb())
-    await call.answer()
-
 
 # ---------------------------------------------------------------------------
 # Fallback
@@ -1475,20 +1268,19 @@ async def fallback(message: Message):
         reply_markup=main_kb(),
     )
 
-
 # ---------------------------------------------------------------------------
 # START
 # ---------------------------------------------------------------------------
 
-
-from aiogram.client.session.aiohttp import AiohttpSession
-
 async def main():
-    session = AiohttpSession(timeout=60)  # <-- ВАЖНО: число, не ClientTimeout
+    if BOT_TOKEN == "PASTE_BOT_TOKEN_HERE" or not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN не задан. Добавь BOT_TOKEN в Railway Variables.")
+
+    session = AiohttpSession(timeout=60)
     bot = Bot(
         BOT_TOKEN,
         session=session,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
 
     dp = Dispatcher()
@@ -1500,14 +1292,9 @@ async def main():
     await dp.start_polling(
         bot,
         allowed_updates=dp.resolve_used_update_types(),
-        polling_timeout=30,     # можно оставить
-        request_timeout=65      # чуть больше, чем polling_timeout
+        polling_timeout=30,
+        request_timeout=65,
     )
 
-
-
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        pass
+    asyncio.run(main())
