@@ -1224,6 +1224,110 @@ async def cb_back(call: CallbackQuery):
 # Admin panel (минимальный)
 # ---------------------------------------------------------------------------
 
+@router.callback_query(F.data == "admin_panel")
+async def cb_admin_panel(call: CallbackQuery):
+    """Открывает админ-панель по кнопке в профиле."""
+    if not is_admin(call.from_user.id):
+        await call.answer("⛔️ Нет доступа", show_alert=True)
+        return
+
+    text = (
+        "🔐 <b>Админ-панель</b>\n\n"
+        "Команды администратора:\n"
+        "• <code>/grant 123456789</code> — выдать доступ по TG ID\n"
+        "• <code>/grant @username</code> — выдать доступ по username\n\n"
+        "Выбери действие ниже:"
+    )
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
+            [InlineKeyboardButton(text="✅ Как выдать доступ", callback_data="admin_grant_help")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="back:profile")],
+        ]
+    )
+
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await call.message.answer(text, reply_markup=kb)
+
+    await call.answer()
+
+
+@router.callback_query(F.data == "admin_grant_help")
+async def cb_admin_grant_help(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("⛔️ Нет доступа", show_alert=True)
+        return
+
+    text = (
+        "✅ <b>Как выдать доступ</b>\n\n"
+        "1) Пользователь должен хотя бы 1 раз нажать /start (чтобы попал в базу).\n"
+        "2) Затем ты в личке с ботом пишешь команду:\n\n"
+        "• <code>/grant 123456789</code>\n"
+        "или\n"
+        "• <code>/grant @username</code>\n\n"
+        "После этого у пользователя откроется полный доступ."
+    )
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_panel")],
+            [InlineKeyboardButton(text="↩️ В профиль", callback_data="back:profile")],
+        ]
+    )
+
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await call.message.answer(text, reply_markup=kb)
+
+    await call.answer()
+
+
+@router.callback_query(F.data == "admin_stats")
+async def cb_admin_stats(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("⛔️ Нет доступа", show_alert=True)
+        return
+
+    async with get_db() as db:
+        cur = await db.execute("SELECT COUNT(*) AS c FROM users")
+        total_users = (await cur.fetchone())["c"]
+
+        cur = await db.execute("SELECT COUNT(*) AS c FROM users WHERE full_access = 1")
+        paid_users = (await cur.fetchone())["c"]
+
+        cur = await db.execute("SELECT COUNT(*) AS c FROM purchases WHERE status = 'pending'")
+        pending_pays = (await cur.fetchone())["c"]
+
+        cur = await db.execute("SELECT COUNT(*) AS c FROM purchases WHERE status = 'paid'")
+        paid_pays = (await cur.fetchone())["c"]
+
+    text = (
+        "📊 <b>Статистика</b>\n\n"
+        f"👥 Всего пользователей: <b>{total_users}</b>\n"
+        f"✅ С доступом: <b>{paid_users}</b>\n\n"
+        f"⏳ Платежи pending: <b>{pending_pays}</b>\n"
+        f"💳 Платежи paid: <b>{paid_pays}</b>"
+    )
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_panel")],
+            [InlineKeyboardButton(text="↩️ В профиль", callback_data="back:profile")],
+        ]
+    )
+
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await call.message.answer(text, reply_markup=kb)
+
+    await call.answer()
+
+
 async def _find_user_by_identifier(identifier: str):
     identifier = identifier.strip()
     async with get_db() as db:
