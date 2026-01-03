@@ -45,7 +45,7 @@ LEVEL1_PERCENT = Decimal(os.getenv("LEVEL1_PERCENT", "0.50"))
 LEVEL2_PERCENT = Decimal(os.getenv("LEVEL2_PERCENT", "0.10"))
 
 # Куда вести после оплаты
-PRIVATE_CHANNEL_URL = os.getenv("PRIVATE_CHANNEL_URL", "https://t.me/+rD28zEPxrmI2M2Iy)
+PRIVATE_CHANNEL_URL = os.getenv("PRIVATE_CHANNEL_URL", "https://t.me/+rD28zEPxrmI2M2Iy")
 COMMUNITY_GROUP_URL = os.getenv("COMMUNITY_GROUP_URL", "https://t.me/your_group_or_forum_link")
 SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT", "@your_support_username")
 
