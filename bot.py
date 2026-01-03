@@ -32,11 +32,11 @@ from aiogram.types import (
 # ---------------------------------------------------------------------------
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "PASTE_BOT_TOKEN_HERE")  # поставь в Railway Variables
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))                 # поставь в Railway Variables (числом)
+ADMIN_ID = int(os.getenv("8585550939", "0"))                 # поставь в Railway Variables (числом)
 
 # TronGrid / TRC20 (USDT)
-TRONGRID_API_KEY = os.getenv("TRONGRID_API_KEY", "")       # можно пустым
-WALLET_ADDRESS = os.getenv("WALLET_ADDRESS", "")           # адрес получателя USDT TRC20 (T...)
+TRONGRID_API_KEY = os.getenv("b33b8d65-10c9-4f7b-99e0-ab47f3bbb60f", "")       # можно пустым
+WALLET_ADDRESS = os.getenv("TMVnoYkCsU3XHV28P5vMZokcWinqE3pUcK", "")           # адрес получателя USDT TRC20 (T...)
 USDT_TRON_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"  # стандартный контракт USDT TRC20
 
 # Цена доступа
@@ -45,7 +45,7 @@ LEVEL1_PERCENT = Decimal(os.getenv("LEVEL1_PERCENT", "0.50"))
 LEVEL2_PERCENT = Decimal(os.getenv("LEVEL2_PERCENT", "0.10"))
 
 # Куда вести после оплаты
-PRIVATE_CHANNEL_URL = os.getenv("PRIVATE_CHANNEL_URL", "https://t.me/your_private_channel_or_invite_link")
+PRIVATE_CHANNEL_URL = os.getenv("PRIVATE_CHANNEL_URL", "https://t.me/+rD28zEPxrmI2M2Iy)
 COMMUNITY_GROUP_URL = os.getenv("COMMUNITY_GROUP_URL", "https://t.me/your_group_or_forum_link")
 SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT", "@your_support_username")
 
