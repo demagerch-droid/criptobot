@@ -797,7 +797,6 @@ async def show_profile(target: Message | CallbackQuery, edit: bool = False):
         f"🆔 ID: <code>{tg_id}</code>\n"
         f"📅 Регистрация: <b>{reg_date}</b>\n\n"
         f"🎟 Доступ: <b>{'Открыт ✅' if access else 'Не оплачен ❌'}</b>\n"
-        f"📚 Прогресс обучения: <b>{progress_str}</b>\n\n"
         "🤝 <b>Партнёрка</b>\n"
         f"• 1 линия: <b>{lvl1}</b>\n"
         f"• 2 линия: <b>{lvl2}</b>\n\n"
