@@ -35,8 +35,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "PASTE_BOT_TOKEN_HERE")  # поставь в 
 ADMIN_ID = int(os.getenv("ADMIN_ID", "8585550939"))                 # поставь в Railway Variables (числом)
 
 # TronGrid / TRC20 (USDT)
-TRONGRID_API_KEY = os.getenv("b33b8d65-10c9-4f7b-99e0-ab47f3bbb60f", "")       # можно пустым
-WALLET_ADDRESS = os.getenv("TMVnoYkCsU3XHV28P5vMZokcWinqE3pUcK", "")           # адрес получателя USDT TRC20 (T...)
+TRONGRID_API_KEY = os.getenv("TRONGRID_API_KEY", "")
+WALLET_ADDRESS  = os.getenv("WALLET_ADDRESS", "")           # адрес получателя USDT TRC20 (T...)
 USDT_TRON_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"  # стандартный контракт USDT TRC20
 
 # Цена доступа
