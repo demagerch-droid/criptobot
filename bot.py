@@ -1087,8 +1087,6 @@ async def show_profile(target: Message | CallbackQuery, edit: bool = False):
     total_earned = Decimal(row["total_earned"])
     click1, _click2 = await count_referrals_clicks(user_db_id)
 
-    click1, _click2 = await count_referrals_clicks(user_db_id)
-
 
     lvl1, lvl2 = await count_referrals(user_db_id)
     progress = await get_progress(user_db_id)
@@ -1273,6 +1271,7 @@ async def cb_my_stats(call: CallbackQuery):
         return
 
     user_db_id = int(row["id"])
+    click1, _click2 = await count_referrals_clicks(user_db_id)
     lvl1, lvl2 = await count_referrals(user_db_id)
     balance = Decimal(row["balance"])
     total_earned = Decimal(row["total_earned"])
