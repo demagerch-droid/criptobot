@@ -32,7 +32,7 @@ from aiogram.types import (
 # ---------------------------------------------------------------------------
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "PASTE_BOT_TOKEN_HERE")  # поставь в Railway Variables
-ADMIN_ID = int(os.getenv("8585550939", "0"))                 # поставь в Railway Variables (числом)
+ADMIN_ID = int(os.getenv("ADMIN_ID", "8585550939"))                 # поставь в Railway Variables (числом)
 
 # TronGrid / TRC20 (USDT)
 TRONGRID_API_KEY = os.getenv("b33b8d65-10c9-4f7b-99e0-ab47f3bbb60f", "")       # можно пустым
@@ -223,6 +223,45 @@ async def init_db():
             """
         )
 
+        # ----------------------------
+        # Withdrawals (вывод средств)
+        # ----------------------------
+        await db.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS withdrawals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                tg_id INTEGER NOT NULL,
+                amount TEXT NOT NULL,
+                wallet TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                decided_at TEXT,
+                decided_by INTEGER,
+                comment TEXT,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            '''
+        )
+
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_withdrawals_user_status ON withdrawals(user_id, status);")
+
+        await db.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS withdrawals_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                withdrawal_id INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                balance_before TEXT,
+                balance_after TEXT,
+                admin_id INTEGER,
+                note TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(withdrawal_id) REFERENCES withdrawals(id) ON DELETE CASCADE
+            );
+            '''
+        )
+
         await db.commit()
 
 # ---------------------------------------------------------------------------
@@ -326,6 +365,225 @@ async def add_balance(user_db_id: int, amount: Decimal):
         )
         await db.commit()
 
+
+
+
+# ---------------------------------------------------------------------------
+# WITHDRAWALS (вывод средств) — Вариант A: “заморозка” при заявке
+# ---------------------------------------------------------------------------
+
+# Пользователь нажал “Вывести” и мы ждём, пока он пришлёт кошелёк одним сообщением.
+# Ключ: tg_id пользователя -> datetime (когда начал процесс)
+WAITING_WITHDRAW_WALLET: dict[int, datetime] = {}
+
+
+def _now_ts() -> str:
+    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _q2(x: Decimal) -> Decimal:
+    return x.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+
+
+async def get_active_withdrawal(user_db_id: int):
+    async with get_db() as db:
+        cur = await db.execute(
+            "SELECT * FROM withdrawals WHERE user_id = ? AND status = 'pending' ORDER BY id DESC LIMIT 1",
+            (user_db_id,),
+        )
+        return await cur.fetchone()
+
+
+async def create_withdrawal_freeze(user_db_id: int, tg_id: int, wallet: str):
+    """
+    Создаёт заявку withdrawals со статусом pending и сразу “замораживает” сумму:
+    - списывает весь доступный balance у пользователя
+    - пишет запись в withdrawals_log
+    Всё делается атомарно (BEGIN IMMEDIATE).
+    Возвращает: (withdrawal_row | None, error_code | None)
+      error_code: 'active' | 'zero' | None
+    """
+    wallet = (wallet or "").strip()
+    async with get_db() as db:
+        try:
+            await db.execute("BEGIN IMMEDIATE;")
+
+            # защита от повторных заявок
+            cur = await db.execute(
+                "SELECT id FROM withdrawals WHERE user_id = ? AND status = 'pending' LIMIT 1",
+                (user_db_id,),
+            )
+            if await cur.fetchone():
+                await db.execute("ROLLBACK;")
+                return None, "active"
+
+            cur = await db.execute("SELECT balance FROM users WHERE id = ?", (user_db_id,))
+            u = await cur.fetchone()
+            if not u:
+                await db.execute("ROLLBACK;")
+                return None, "zero"
+
+            bal_before = Decimal(u["balance"])
+            if bal_before <= 0:
+                await db.execute("ROLLBACK;")
+                return None, "zero"
+
+            amount = _q2(bal_before)  # замораживаем весь доступный баланс
+            bal_after = _q2(bal_before - amount)
+
+            await db.execute(
+                "UPDATE users SET balance = ? WHERE id = ?",
+                (str(bal_after), user_db_id),
+            )
+
+            created_at = _now_ts()
+            cur2 = await db.execute(
+                """
+                INSERT INTO withdrawals (user_id, tg_id, amount, wallet, status, created_at)
+                VALUES (?, ?, ?, ?, 'pending', ?)
+                """,
+                (user_db_id, tg_id, str(amount), wallet, created_at),
+            )
+            withdrawal_id = cur2.lastrowid
+
+            await db.execute(
+                """
+                INSERT INTO withdrawals_log (withdrawal_id, action, balance_before, balance_after, admin_id, note, created_at)
+                VALUES (?, 'create', ?, ?, NULL, ?, ?)
+                """,
+                (withdrawal_id, str(bal_before), str(bal_after), "freeze_on_request", created_at),
+            )
+
+            await db.commit()
+
+            cur3 = await db.execute("SELECT * FROM withdrawals WHERE id = ?", (withdrawal_id,))
+            row = await cur3.fetchone()
+            return row, None
+        except Exception:
+            try:
+                await db.execute("ROLLBACK;")
+            except Exception:
+                pass
+            raise
+
+
+async def get_withdrawal_by_id(withdrawal_id: int):
+    async with get_db() as db:
+        cur = await db.execute("SELECT * FROM withdrawals WHERE id = ?", (withdrawal_id,))
+        return await cur.fetchone()
+
+
+async def admin_mark_withdrawal_paid(withdrawal_id: int, admin_tg_id: int):
+    """
+    Админ нажал ✅ Оплачено:
+    - меняем статус pending -> paid
+    - пишем лог
+    Атомарно.
+    Возвращает: (row_before | None, error_code | None)
+      error_code: 'not_found' | 'already'
+    """
+    async with get_db() as db:
+        try:
+            await db.execute("BEGIN IMMEDIATE;")
+            cur = await db.execute("SELECT * FROM withdrawals WHERE id = ?", (withdrawal_id,))
+            wd = await cur.fetchone()
+            if not wd:
+                await db.execute("ROLLBACK;")
+                return None, "not_found"
+            if wd["status"] != "pending":
+                await db.execute("ROLLBACK;")
+                return wd, "already"
+
+            decided_at = _now_ts()
+            await db.execute(
+                """
+                UPDATE withdrawals
+                SET status = 'paid', decided_at = ?, decided_by = ?
+                WHERE id = ?
+                """,
+                (decided_at, admin_tg_id, withdrawal_id),
+            )
+
+            await db.execute(
+                """
+                INSERT INTO withdrawals_log (withdrawal_id, action, balance_before, balance_after, admin_id, note, created_at)
+                VALUES (?, 'paid', NULL, NULL, ?, NULL, ?)
+                """,
+                (withdrawal_id, admin_tg_id, decided_at),
+            )
+
+            await db.commit()
+            return wd, None
+        except Exception:
+            try:
+                await db.execute("ROLLBACK;")
+            except Exception:
+                pass
+            raise
+
+
+async def admin_decline_withdrawal(withdrawal_id: int, admin_tg_id: int, comment: str = ""):
+    """
+    Админ нажал ❌ Отклонить:
+    - pending -> declined
+    - возвращаем замороженную сумму обратно в users.balance
+    - пишем лог
+    Атомарно.
+    Возвращает: (wd_row_before | None, error_code | None)
+      error_code: 'not_found' | 'already'
+    """
+    comment = (comment or "").strip()
+    async with get_db() as db:
+        try:
+            await db.execute("BEGIN IMMEDIATE;")
+
+            cur = await db.execute("SELECT * FROM withdrawals WHERE id = ?", (withdrawal_id,))
+            wd = await cur.fetchone()
+            if not wd:
+                await db.execute("ROLLBACK;")
+                return None, "not_found"
+            if wd["status"] != "pending":
+                await db.execute("ROLLBACK;")
+                return wd, "already"
+
+            amount = Decimal(wd["amount"])
+
+            cur2 = await db.execute("SELECT balance FROM users WHERE id = ?", (int(wd["user_id"]),))
+            u = await cur2.fetchone()
+            bal_before = Decimal(u["balance"]) if u else Decimal("0")
+            bal_after = _q2(bal_before + amount)
+
+            await db.execute(
+                "UPDATE users SET balance = ? WHERE id = ?",
+                (str(bal_after), int(wd["user_id"])),
+            )
+
+            decided_at = _now_ts()
+            await db.execute(
+                """
+                UPDATE withdrawals
+                SET status = 'declined', decided_at = ?, decided_by = ?, comment = ?
+                WHERE id = ?
+                """,
+                (decided_at, admin_tg_id, comment, withdrawal_id),
+            )
+
+            await db.execute(
+                """
+                INSERT INTO withdrawals_log (withdrawal_id, action, balance_before, balance_after, admin_id, note, created_at)
+                VALUES (?, 'declined', ?, ?, ?, ?, ?)
+                """,
+                (withdrawal_id, str(bal_before), str(bal_after), admin_tg_id, comment or "declined", decided_at),
+            )
+
+            await db.commit()
+            return wd, None
+        except Exception:
+            try:
+                await db.execute("ROLLBACK;")
+            except Exception:
+                pass
+            raise
 
 async def count_referrals(user_db_id: int):
     async with get_db() as db:
@@ -1020,40 +1278,42 @@ async def cb_top_refs(call: CallbackQuery):
 
 @router.callback_query(F.data == "withdraw")
 async def cb_withdraw(call: CallbackQuery):
-    row = await get_user_by_tg(call.from_user.id)
-    if not row:
-        await call.answer("Сначала нажми /start", show_alert=True)
+    if is_spam(call.from_user.id):
         return
 
-    if not bool(row["full_access"]):
-        await call.answer("Сначала открой доступ — партнёрка активируется после оплаты.", show_alert=True)
+    tg_id = call.from_user.id
+    user = await get_user_by_tg(tg_id)
+    if not user:
+        await call.answer("Сначала нажми /start 🙂", show_alert=True)
         return
 
-    balance = Decimal(row["balance"])
-    text = (
-        "💸 <b>Запрос вывода</b>\n\n"
-        f"Твой текущий баланс: <b>{balance.quantize(Decimal('0.01'))}$</b>\n\n"
-        "Чтобы запросить вывод, напиши администратору в поддержку и укажи:\n"
-        "• сумму\n"
-        "• твой USDT-адрес (TRC20)\n\n"
-        f"Поддержка: {SUPPORT_CONTACT}"
+    if not user["full_access"]:
+        await call.answer("У тебя нет полного доступа.", show_alert=True)
+        return
+
+    # защита от повторных заявок
+    active = await get_active_withdrawal(user["id"])
+    if active:
+        await call.answer("У тебя уже есть активная заявка на вывод ⏳", show_alert=True)
+        return
+
+    bal = Decimal(user["balance"])
+    if bal <= 0:
+        await call.answer("У тебя пока нет доступного баланса для вывода 🙂", show_alert=True)
+        return
+
+    WAITING_WITHDRAW_WALLET[tg_id] = datetime.utcnow()
+
+    await call.message.answer(
+        f"""💸 <b>Вывод средств</b>
+
+Твой доступный баланс: <b>{bal}$</b>
+
+Отправь одним сообщением свой <b>USDT-адрес (TRC20)</b>.
+После этого заявка будет создана, а сумма — <b>заморожена</b> до решения администратора 🙂
+
+Если передумал — напиши <b>отмена</b>."""
     )
-    try:
-        await call.message.edit_text(text, reply_markup=kb_back("back:earn"))
-    except Exception:
-        await call.message.answer(text, reply_markup=kb_back("back:earn"))
-
-    try:
-        await call.bot.send_message(
-            ADMIN_ID,
-            "📥 <b>Запрос вывода</b>\n"
-            f"От: <code>{call.from_user.id}</code>\n"
-            f"Username: @{call.from_user.username or '—'}\n"
-            f"Баланс: {balance}$",
-        )
-    except Exception:
-        pass
-
     await call.answer()
 
 # ---------------------------------------------------------------------------
@@ -1082,6 +1342,101 @@ async def cb_faq(call: CallbackQuery):
     except Exception:
         await call.message.answer(text, reply_markup=kb_back("back:profile"))
     await call.answer()
+
+def _looks_like_trc20(wallet: str) -> bool:
+    w = (wallet or "").strip()
+    # Простейшая проверка TRC20-адреса (обычно начинается на 'T')
+    if len(w) < 26 or len(w) > 60:
+        return False
+    if not w.startswith("T"):
+        return False
+    return all(ch.isalnum() for ch in w)
+
+
+@router.callback_query(F.data.startswith("wd_ok:"))
+async def cb_withdraw_ok(call: CallbackQuery):
+    if is_spam(call.from_user.id):
+        return
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+
+    try:
+        withdrawal_id = int(call.data.split(":", 1)[1])
+    except Exception:
+        await call.answer("Ошибка данных.", show_alert=True)
+        return
+
+    wd, err = await admin_mark_withdrawal_paid(withdrawal_id, call.from_user.id)
+    if err == "not_found":
+        await call.answer("Заявка не найдена.", show_alert=True)
+        return
+    if err == "already":
+        await call.answer("Эта заявка уже обработана.", show_alert=True)
+        return
+
+    # уведомляем пользователя
+    try:
+        await call.bot.send_message(
+            int(wd["tg_id"]),
+            f"""✅ <b>Заявка на вывод оплачена</b>
+
+Сумма: <b>{wd['amount']}$</b>
+Если оплата не дошла — напиши администратору 🙂""",
+        )
+    except Exception:
+        pass
+
+    # помечаем сообщение админа
+    try:
+        await call.message.edit_text((call.message.text or "") + "\n\n✅ <b>Статус:</b> ОПЛАЧЕНО")
+    except Exception:
+        pass
+
+    await call.answer("Оплачено ✅")
+
+
+@router.callback_query(F.data.startswith("wd_no:"))
+async def cb_withdraw_decline(call: CallbackQuery):
+    if is_spam(call.from_user.id):
+        return
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+
+    try:
+        withdrawal_id = int(call.data.split(":", 1)[1])
+    except Exception:
+        await call.answer("Ошибка данных.", show_alert=True)
+        return
+
+    wd, err = await admin_decline_withdrawal(withdrawal_id, call.from_user.id)
+    if err == "not_found":
+        await call.answer("Заявка не найдена.", show_alert=True)
+        return
+    if err == "already":
+        await call.answer("Эта заявка уже обработана.", show_alert=True)
+        return
+
+    # уведомляем пользователя + сумма вернулась на баланс
+    try:
+        await call.bot.send_message(
+            int(wd["tg_id"]),
+            f"""❌ <b>Заявка на вывод отклонена</b>
+
+Сумма <b>{wd['amount']}$</b> возвращена на баланс.
+Если думаешь, что это ошибка — напиши администратору 🙂""",
+        )
+    except Exception:
+        pass
+
+    # помечаем сообщение админа
+    try:
+        await call.message.edit_text((call.message.text or "") + "\n\n❌ <b>Статус:</b> ОТКЛОНЕНО")
+    except Exception:
+        pass
+
+    await call.answer("Отклонено ❌")
 
 @router.callback_query(F.data == "support")
 async def cb_support(call: CallbackQuery):
@@ -1346,6 +1701,89 @@ async def cmd_grant(message: Message):
 # ---------------------------------------------------------------------------
 # Fallback
 # ---------------------------------------------------------------------------
+
+@router.message(F.text)
+async def handle_withdraw_wallet_input(message: Message):
+    """Ловим кошелёк после нажатия “Вывести” (вариант A: заморозка при заявке)."""
+    tg_id = message.from_user.id
+    if tg_id not in WAITING_WITHDRAW_WALLET:
+        return
+
+    txt = (message.text or "").strip()
+    low = txt.lower()
+
+    if low in ("отмена", "cancel", "стоп"):
+        WAITING_WITHDRAW_WALLET.pop(tg_id, None)
+        await message.answer("Ок, отменено ✅")
+        return
+
+    if not _looks_like_trc20(txt):
+        await message.answer(
+            """Похоже, адрес неверный 😅
+Пришли ещё раз <b>USDT-адрес (TRC20)</b> (обычно начинается на <b>T</b>)."""
+        )
+        return
+
+    user = await get_user_by_tg(tg_id)
+    if not user:
+        WAITING_WITHDRAW_WALLET.pop(tg_id, None)
+        await message.answer("Сначала нажми /start 🙂")
+        return
+
+    if not user["full_access"]:
+        WAITING_WITHDRAW_WALLET.pop(tg_id, None)
+        await message.answer("У тебя нет полного доступа.")
+        return
+
+    wd, err = await create_withdrawal_freeze(user["id"], tg_id, txt)
+    WAITING_WITHDRAW_WALLET.pop(tg_id, None)
+
+    if err == "active":
+        await message.answer("У тебя уже есть активная заявка на вывод ⏳")
+        return
+    if err == "zero":
+        await message.answer("У тебя пока нет доступного баланса для вывода 🙂")
+        return
+
+    await message.answer(
+        f"""✅ <b>Заявка на вывод создана</b>
+
+Сумма: <b>{wd['amount']}$</b>
+Кошелёк: <code>{wd['wallet']}</code>
+Статус: <b>pending</b> ⏳
+
+После решения администратора я пришлю сообщение 🙂"""
+    )
+
+    # уведомляем админа + кнопки
+    try:
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="✅ Оплачено", callback_data=f"wd_ok:{wd['id']}"),
+                    InlineKeyboardButton(text="❌ Отклонить", callback_data=f"wd_no:{wd['id']}"),
+                ]
+            ]
+        )
+
+        uname = message.from_user.username or ""
+        uname_line = f"@{uname}" if uname else "—"
+
+        await message.bot.send_message(
+            ADMIN_ID,
+            f"""📥 <b>Заявка на вывод</b>
+
+ID: <b>#{wd['id']}</b>
+Пользователь: <b>{message.from_user.full_name}</b>
+Username: {uname_line}
+TG ID: <code>{tg_id}</code>
+Сумма: <b>{wd['amount']}$</b>
+Кошелёк: <code>{wd['wallet']}</code>
+Статус: <b>pending</b> ⏳""",
+            reply_markup=kb,
+        )
+    except Exception as e:
+        logger.exception("Не удалось уведомить админа о выводе: %s", e)
 
 @router.message()
 async def fallback(message: Message):
