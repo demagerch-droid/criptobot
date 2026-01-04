@@ -585,7 +585,8 @@ async def admin_decline_withdrawal(withdrawal_id: int, admin_tg_id: int, comment
                 pass
             raise
 
-async def count_referrals(user_db_id: int):
+async def count_referrals_clicks(user_db_id: int):
+    """Сколько пользователей пришло по реф-ссылке (по факту /start с ref)."""
     async with get_db() as db:
         cur1 = await db.execute("SELECT COUNT(*) AS c FROM users WHERE referrer_id = ?", (user_db_id,))
         lvl1 = (await cur1.fetchone())["c"]
@@ -600,6 +601,47 @@ async def count_referrals(user_db_id: int):
         lvl2 = (await cur2.fetchone())["c"]
 
         return int(lvl1), int(lvl2)
+
+
+async def count_referrals(user_db_id: int):
+    """Сколько рефералов оплатили доступ (1 и 2 линия)."""
+    async with get_db() as db:
+        # 1 линия: пришли по твоей ссылке и оплатили access
+        cur1 = await db.execute(
+            """
+            SELECT COUNT(DISTINCT u.id) AS c
+            FROM users u
+            WHERE u.referrer_id = ?
+              AND EXISTS (
+                SELECT 1 FROM purchases p
+                WHERE p.user_id = u.id
+                  AND p.status = 'paid'
+                  AND p.product_code = 'access'
+              )
+            """,
+            (user_db_id,),
+        )
+        lvl1 = (await cur1.fetchone())["c"]
+
+        # 2 линия: пришли по ссылке твоих рефералов 1 линии и оплатили access
+        cur2 = await db.execute(
+            """
+            SELECT COUNT(DISTINCT u.id) AS c
+            FROM users u
+            WHERE u.referrer_id IN (SELECT id FROM users WHERE referrer_id = ?)
+              AND EXISTS (
+                SELECT 1 FROM purchases p
+                WHERE p.user_id = u.id
+                  AND p.status = 'paid'
+                  AND p.product_code = 'access'
+              )
+            """,
+            (user_db_id,),
+        )
+        lvl2 = (await cur2.fetchone())["c"]
+
+        return int(lvl1), int(lvl2)
+
 
 
 async def top_referrers(limit: int = 10):
@@ -1043,6 +1085,11 @@ async def show_profile(target: Message | CallbackQuery, edit: bool = False):
     access = bool(row["full_access"])
     balance = Decimal(row["balance"])
     total_earned = Decimal(row["total_earned"])
+    click1, _click2 = await count_referrals_clicks(user_db_id)
+
+    click1, _click2 = await count_referrals_clicks(user_db_id)
+
+
     lvl1, lvl2 = await count_referrals(user_db_id)
     progress = await get_progress(user_db_id)
     progress_str = (f"{max(progress+1, 0)}/{len(MODULES)}" if progress >= 0 else f"0/{len(MODULES)}") if len(MODULES) else "—"
@@ -1055,6 +1102,7 @@ async def show_profile(target: Message | CallbackQuery, edit: bool = False):
         f"📅 Регистрация: <b>{reg_date}</b>\n\n"
         f"🎟 Доступ: <b>{'Открыт ✅' if access else 'Не оплачен ❌'}</b>\n"
         "🤝 <b>Партнёрка</b>\n"
+        f"• Перешли по ссылке: <b>{click1}</b>\n"
         f"• 1 линия: <b>{lvl1}</b>\n"
         f"• 2 линия: <b>{lvl2}</b>\n\n"
         f"💰 Баланс к выводу: <b>{balance.quantize(Decimal('0.01'))}$</b>\n"
@@ -1233,6 +1281,7 @@ async def cb_my_stats(call: CallbackQuery):
     text = (
         "📊 <b>Моя статистика</b>\n\n"
         f"Доступ: <b>{'Открыт ✅' if access else 'Не оплачен ❌'}</b>\n\n"
+        f"👤 Перешли по ссылке: <b>{click1}</b>\n\n"
         f"👥 Партнёры 1 линии: <b>{lvl1}</b>\n"
         f"👥 Партнёры 2 линии: <b>{lvl2}</b>\n"
         f"👥 Всего: <b>{lvl1 + lvl2}</b>\n\n"
