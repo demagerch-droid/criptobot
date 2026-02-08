@@ -39,10 +39,9 @@ TRONGRID_API_KEY = os.getenv("TRONGRID_API_KEY", "")
 WALLET_ADDRESS  = os.getenv("WALLET_ADDRESS", "")           # адрес получателя USDT TRC20 (T...)
 USDT_TRON_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"  # стандартный контракт USDT TRC20
 
-# Цена доступа
-PRICE_ACCESS = Decimal(os.getenv("PRICE_ACCESS", "200"))   # $200
-LEVEL1_PERCENT = Decimal(os.getenv("LEVEL1_PERCENT", "0.50"))
-LEVEL2_PERCENT = Decimal(os.getenv("LEVEL2_PERCENT", "0.10"))
+# Подписка (месячная)
+PRICE_MONTH = Decimal(os.getenv("PRICE_MONTH", "20"))  # $20 / 30 дней
+SUB_DAYS = int(os.getenv("SUB_DAYS", "30"))
 
 # Куда вести после оплаты
 PRIVATE_CHANNEL_URL = os.getenv("PRIVATE_CHANNEL_URL", "https://t.me/+rD28zEPxrmI2M2Iy")
@@ -67,7 +66,7 @@ print("DB_PATH =", DB_PATH)
 # ---------------------------------------------------------------------------
 
 PROJECT_NAME = "Traffic Partner Bot"
-ACCESS_NAME = "Полный доступ"
+ACCESS_NAME = "PRO подписка"
 
 MODULES = []  # меню модулей отключено
 
@@ -126,15 +125,17 @@ async def init_db():
                     tg_id INTEGER UNIQUE NOT NULL,
                     username TEXT DEFAULT '',
                     first_name TEXT DEFAULT '',
-                    referrer_id INTEGER,
                     reg_date TEXT,
+                    sub_until TEXT DEFAULT '',
+                    free_trial_used INTEGER DEFAULT 0,
+                    -- legacy fields (оставлены для совместимости со старой БД)
+                    referrer_id INTEGER,
                     full_access INTEGER DEFAULT 0,
                     balance TEXT DEFAULT '0',
                     total_earned TEXT DEFAULT '0',
                     is_blocked INTEGER DEFAULT 0,
                     FOREIGN KEY(referrer_id) REFERENCES users(id)
-                );
-                """
+                );"""
             )
 
         if not users_exists:
@@ -194,6 +195,15 @@ async def init_db():
                 await db.execute("DROP TABLE users_old;")
                 await db.execute("PRAGMA foreign_keys=ON;")
                 await db.commit()
+
+        # --- миграция: добавляем новые колонки для подписки, если их нет
+        cur = await db.execute("PRAGMA table_info(users)")
+        cols2 = [r["name"] for r in await cur.fetchall()]
+        if "sub_until" not in cols2:
+            await db.execute("ALTER TABLE users ADD COLUMN sub_until TEXT DEFAULT ''")
+        if "free_trial_used" not in cols2:
+            await db.execute("ALTER TABLE users ADD COLUMN free_trial_used INTEGER DEFAULT 0")
+        await db.commit()
 
         await db.execute(
             """
@@ -272,7 +282,7 @@ async def get_user_by_tg(tg_id: int):
     async with get_db() as db:
         cur = await db.execute(
             """
-            SELECT id, tg_id, username, first_name, referrer_id, reg_date, full_access, balance, total_earned
+            SELECT id, tg_id, username, first_name, reg_date, sub_until, free_trial_used, full_access, balance, total_earned, referrer_id, is_blocked
             FROM users WHERE tg_id = ?
             """,
             (tg_id,),
@@ -325,15 +335,51 @@ async def get_or_create_user(tg_user, referrer_tg_id: int | None):
     )
 
 
-async def set_full_access(user_db_id: int, value: bool = True):
+
+# ---------------------------------------------------------------------------
+# Подписка
+# ---------------------------------------------------------------------------
+
+def _parse_dt(ts: str) -> datetime | None:
+    ts = (ts or "").strip()
+    if not ts:
+        return None
+    try:
+        return datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
+def _fmt_dt(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+async def get_sub_until(user_db_id: int) -> datetime | None:
     async with get_db() as db:
-        await db.execute("UPDATE users SET full_access = ? WHERE id = ?", (1 if value else 0, user_db_id))
+        cur = await db.execute("SELECT sub_until FROM users WHERE id = ?", (user_db_id,))
+        row = await cur.fetchone()
+        return _parse_dt(row["sub_until"]) if row else None
+
+async def set_sub_until(user_db_id: int, until_dt: datetime | None):
+    async with get_db() as db:
+        await db.execute("UPDATE users SET sub_until = ? WHERE id = ?", (_fmt_dt(until_dt) if until_dt else "", user_db_id))
         await db.commit()
 
+async def extend_subscription(user_db_id: int, days: int = SUB_DAYS):
+    now = datetime.utcnow()
+    current = await get_sub_until(user_db_id)
+    base = current if (current and current > now) else now
+    new_until = base + timedelta(days=days)
+    await set_sub_until(user_db_id, new_until)
+    return new_until
 
 async def has_access_by_tg(tg_id: int) -> bool:
+    """Совместимость: раньше был full_access, теперь — активная подписка."""
     row = await get_user_by_tg(tg_id)
-    return bool(row and row["full_access"])
+    if not row:
+        return False
+    dt = _parse_dt(row["sub_until"]) if (hasattr(row, "keys") and "sub_until" in row.keys()) else None
+    if not dt:
+        return False
+    return dt > datetime.utcnow()
 
 
 async def get_referrer_chain(user_db_id: int):
@@ -616,7 +662,7 @@ async def count_referrals(user_db_id: int):
                 SELECT 1 FROM purchases p
                 WHERE p.user_id = u.id
                   AND p.status = 'paid'
-                  AND p.product_code = 'access'
+                  AND p.product_code = 'sub_month'
               )
             """,
             (user_db_id,),
@@ -633,7 +679,7 @@ async def count_referrals(user_db_id: int):
                 SELECT 1 FROM purchases p
                 WHERE p.user_id = u.id
                   AND p.status = 'paid'
-                  AND p.product_code = 'access'
+                  AND p.product_code = 'sub_month'
               )
             """,
             (user_db_id,),
@@ -738,64 +784,31 @@ async def get_tg_id_by_user_db(user_db_id: int) -> int | None:
 
 
 async def process_successful_payment(bot: Bot, purchase_row):
-    purchase_id = int(purchase_row["id"])
     user_db_id = int(purchase_row["user_id"])
     product_code = purchase_row["product_code"]
 
-    if product_code != "access":
+    if product_code != "sub_month":
         return
 
-    await set_full_access(user_db_id, True)
-
-    lvl1, lvl2 = await get_referrer_chain(user_db_id)
-    base = PRICE_ACCESS
-
-    lvl1_bonus = (base * LEVEL1_PERCENT).quantize(Decimal("0.01"))
-    lvl2_bonus = (base * LEVEL2_PERCENT).quantize(Decimal("0.01"))
-
-    if lvl1:
-        await add_balance(lvl1, lvl1_bonus)
-        tg_id_1 = await get_tg_id_by_user_db(lvl1)
-        if tg_id_1:
-            try:
-                await bot.send_message(
-                    tg_id_1,
-                    "💰 <b>Начисление партнёрки</b>\n\n"
-                    "Твой партнёр оплатил доступ.\n"
-                    f"Тебе начислено: <b>{lvl1_bonus}$</b> (1 уровень).",
-                    reply_markup=main_kb(),
-                )
-            except Exception:
-                pass
-
-    if lvl2:
-        await add_balance(lvl2, lvl2_bonus)
-        tg_id_2 = await get_tg_id_by_user_db(lvl2)
-        if tg_id_2:
-            try:
-                await bot.send_message(
-                    tg_id_2,
-                    "💸 <b>Начисление партнёрки</b>\n\n"
-                    "Покупка прошла во 2-й линии.\n"
-                    f"Тебе начислено: <b>{lvl2_bonus}$</b> (2 уровень).",
-                    reply_markup=main_kb(),
-                )
-            except Exception:
-                pass
+    new_until = await extend_subscription(user_db_id, SUB_DAYS)
 
     buyer_tg_id = await get_tg_id_by_user_db(user_db_id)
     if buyer_tg_id:
+        text = f"""✅ <b>Оплата подтверждена!</b>
+
+⭐️ Подписка активна до: <b>{new_until.strftime('%d.%m.%Y %H:%M')} UTC</b>
+
+Теперь тебе доступно:
+• материалы и инструкции
+• доступ к закрытому каналу/чату
+
+Жми <b>«Обучение»</b> снизу — и начинай 🔥"""
         await bot.send_message(
             buyer_tg_id,
-            "✅ <b>Оплата подтверждена!</b>\n\n"
-            "Доступ открыт <b>навсегда</b>.\n\n"
-            "Теперь тебе доступны:\n"
-            "• все 6 модулей обучения\n"
-            "• партнёрская программа 50% + 10%\n"
-            "• реферальная ссылка и статистика\n\n"
-            "Жми <b>«Обучение»</b> снизу — и начинай 🔥",
+            text,
             reply_markup=main_kb(),
         )
+
 
 
 async def fetch_trc20_transactions() -> list:
@@ -862,12 +875,12 @@ def main_kb() -> ReplyKeyboardMarkup:
         keyboard=[
             [
                 KeyboardButton(text="🧠 Обучение"),
-                KeyboardButton(text="💸 Заработок"),
+                KeyboardButton(text="⭐️ Подписка"),
                 KeyboardButton(text="👤 Профиль"),
             ]
         ],
         resize_keyboard=True,
-        input_field_placeholder="Выбери раздел снизу 👇",
+        input_field_placeholder="Выбери раздел 👇",
     )
 
 
@@ -878,7 +891,7 @@ def kb_back(cb: str) -> InlineKeyboardMarkup:
 def kb_buy(back_cb: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text=f"💳 Купить доступ ({PRICE_ACCESS}$)", callback_data="buy_access")],
+            [InlineKeyboardButton(text=f"💳 Оформить подписку ({PRICE_MONTH}$ / {SUB_DAYS}д)", callback_data="buy_access")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data=back_cb)],
         ]
     )
@@ -886,13 +899,16 @@ def kb_buy(back_cb: str) -> InlineKeyboardMarkup:
 
 def kb_training(has_access: bool) -> InlineKeyboardMarkup:
     """Кнопки для раздела обучения.
-    Модули убраны: оставляем только покупку (если нет доступа) и ссылки в закрытый канал/группу (если доступ есть).
+    Модули убраны: оставляем ссылки (если подписка активна) или оплату (если нет).
     """
     rows = []
     if has_access:
-        rows.append([InlineKeyboardButton(text="🔗 Перейти в закрытый канал", url=PRIVATE_CHANNEL_URL)])
+        if PRIVATE_CHANNEL_URL:
+            rows.append([InlineKeyboardButton(text="🔗 Закрытый канал", url=PRIVATE_CHANNEL_URL)])
+        if COMMUNITY_GROUP_URL:
+            rows.append([InlineKeyboardButton(text="💬 Чат / Группа", url=COMMUNITY_GROUP_URL)])
     else:
-        rows.append([InlineKeyboardButton(text=f"💳 Купить доступ ({PRICE_ACCESS}$)", callback_data="buy_access")])
+        rows.append([InlineKeyboardButton(text=f"💳 Оформить подписку ({PRICE_MONTH}$ / {SUB_DAYS}д)", callback_data="buy_access")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -901,7 +917,7 @@ def kb_earn(has_access: bool) -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="📌 Как работает партнёрка", callback_data="earn_info")],
-                [InlineKeyboardButton(text=f"💳 Открыть доступ ({PRICE_ACCESS}$)", callback_data="buy_access")],
+                [InlineKeyboardButton(text=f"💳 Оформить подписку ({PRICE_MONTH}$)", callback_data="buy_access")],
             ]
         )
 
@@ -917,11 +933,12 @@ def kb_earn(has_access: bool) -> InlineKeyboardMarkup:
 
 def kb_profile(has_access: bool, is_admin_flag: bool) -> InlineKeyboardMarkup:
     rows = []
+
+    # подписка
     if has_access:
-        rows.append([InlineKeyboardButton(text="🔗 Моя реферальная ссылка", callback_data="my_ref")])
-        rows.append([InlineKeyboardButton(text="📊 Моя статистика", callback_data="my_stats")])
+        rows.append([InlineKeyboardButton(text="⭐️ Подписка (активна)", callback_data="open_sub")])
     else:
-        rows.append([InlineKeyboardButton(text=f"💳 Купить доступ ({PRICE_ACCESS}$)", callback_data="buy_access")])
+        rows.append([InlineKeyboardButton(text="⭐️ Подписка (оформить)", callback_data="open_sub")])
 
     rows.append([InlineKeyboardButton(text="ℹ️ FAQ", callback_data="faq")])
     rows.append([InlineKeyboardButton(text="💬 Поддержка", callback_data="support")])
@@ -969,20 +986,21 @@ def is_admin(tg_id: int) -> bool:
 # ---------------------------------------------------------------------------
 
 async def show_home(message: Message):
-    text = f"""👋 <b>Привет!</b> Ты в <b>{PROJECT_NAME}</b>
+    # Главный экран (без рефералок, с подпиской)
+    row = await get_user_by_tg(message.from_user.id)
+    sub_until = _parse_dt(row["sub_until"]) if row and "sub_until" in row.keys() else None
+    active = bool(sub_until and sub_until > datetime.utcnow())
 
-Здесь всё построено максимально просто:
-1) Ты изучаешь систему перелива трафика (УБД) и внедряешь её на практике
-2) Забираешь готовую механику воронки «контент → бот → покупка»
-3) При желании подключаешь партнёрку и зарабатываешь на рекомендациях
+    status = f"Активна до <b>{sub_until.strftime('%d.%m.%Y %H:%M')} UTC</b> ✅" if active else "Не активна ❌"
 
-🎟 <b>{ACCESS_NAME}</b> — <b>{PRICE_ACCESS}$</b> и <b>навсегда</b>.
-После оплаты:
-• открывается доступ к закрытому каналу и группе
-• появляется реферальная ссылка
-• включается статистика и партнёрские начисления
+    text = f"""⚡️ <b>{PROJECT_NAME}</b>
 
-👇 Выбирай раздел снизу: <b>Обучение / Заработок / Профиль</b>"""
+Здесь ты получаешь доступ к материалам и закрытому каналу/чату без лишней воды.
+
+⭐️ <b>Подписка:</b> <b>{PRICE_MONTH}$</b> / <b>{SUB_DAYS} дней</b>
+🧾 <b>Статус:</b> {status}
+
+👇 Выбирай раздел снизу:"""
     await message.answer(text, reply_markup=main_kb())
 
 
@@ -999,7 +1017,7 @@ async def show_training(target: Message | CallbackQuery, edit: bool = False):
     if has:
         text = """🧠 <b>Обучение</b>
 
-✅ <b>Доступ активен</b>
+✅ <b>Подписка активна</b>
 Ниже — кнопки на закрытый канал и группу.
 
 📌 Совет: сохраняй полезные вопросы и задавай их в чате 🙂"""
@@ -1008,7 +1026,7 @@ async def show_training(target: Message | CallbackQuery, edit: bool = False):
 
 Здесь — база по переливу трафика: прогрев, креативы, аналитика, переход в Telegram и масштабирование.
 
-🔒 Доступ к закрытым материалам открывается после оплаты.
+🔒 Доступ к материалам открывается после оплаты подписки.
 Нажми кнопку ниже, чтобы купить доступ ✅"""
 
     kb = kb_training(has)
@@ -1022,6 +1040,57 @@ async def show_training(target: Message | CallbackQuery, edit: bool = False):
 
     await msg.answer(text, reply_markup=kb)
 
+
+
+async def show_subscription(target: Message | CallbackQuery, edit: bool = False):
+    if isinstance(target, CallbackQuery):
+        tg_id = target.from_user.id
+        msg = target.message
+    else:
+        tg_id = target.from_user.id
+        msg = target
+
+    row = await get_user_by_tg(tg_id)
+    sub_until = _parse_dt(row["sub_until"]) if row and "sub_until" in row.keys() else None
+    now = datetime.utcnow()
+    active = bool(sub_until and sub_until > now)
+
+    if active:
+        left_days = max((sub_until - now).days, 0)
+        text = (
+            "⭐️ <b>Подписка</b>\n\n"
+            f"✅ Активна до: <b>{sub_until.strftime('%d.%m.%Y %H:%M')} UTC</b>\n"
+            f"⏳ Осталось примерно: <b>{left_days} дн.</b>\n\n"
+            f"Тариф: <b>{PRICE_MONTH}$</b> / <b>{SUB_DAYS} дней</b>\n\n"
+            "Хочешь — можешь продлить заранее (дни прибавятся)."
+        )
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text=f"🔄 Продлить ({PRICE_MONTH}$ / {SUB_DAYS}д)", callback_data="buy_access")],
+            ]
+        )
+    else:
+        text = (
+            "⭐️ <b>Подписка</b>\n\n"
+            "❌ Сейчас подписка не активна.\n\n"
+            f"Тариф: <b>{PRICE_MONTH}$</b> / <b>{SUB_DAYS} дней</b>\n"
+            "Оплата: <b>USDT (TRC20)</b>\n\n"
+            "Нажми кнопку ниже — бот выдаст точную сумму и кошелёк для оплаты."
+        )
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text=f"💳 Оформить ({PRICE_MONTH}$ / {SUB_DAYS}д)", callback_data="buy_access")],
+            ]
+        )
+
+    if edit and isinstance(target, CallbackQuery):
+        try:
+            await msg.edit_text(text, reply_markup=kb)
+            return
+        except Exception:
+            pass
+
+    await msg.answer(text, reply_markup=kb)
 
 async def show_earn(target: Message | CallbackQuery, edit: bool = False):
     if isinstance(target, CallbackQuery):
@@ -1069,45 +1138,36 @@ async def show_profile(target: Message | CallbackQuery, edit: bool = False):
     if isinstance(target, CallbackQuery):
         tg_id = target.from_user.id
         msg = target.message
+        tg_user = target.from_user
     else:
         tg_id = target.from_user.id
         msg = target
+        tg_user = target.from_user
 
     row = await get_user_by_tg(tg_id)
     if not row:
-        await get_or_create_user(target.from_user if isinstance(target, Message) else target.from_user, None)
+        await get_or_create_user(tg_user, None)
         row = await get_user_by_tg(tg_id)
 
-    user_db_id = int(row["id"])
     username = row["username"] or ""
     first_name = row["first_name"] or ""
     reg_date = row["reg_date"] or "—"
-    access = bool(row["full_access"])
-    balance = Decimal(row["balance"])
-    total_earned = Decimal(row["total_earned"])
-    click1, _click2 = await count_referrals_clicks(user_db_id)
 
+    sub_until = _parse_dt(row["sub_until"]) if "sub_until" in row.keys() else None
+    now = datetime.utcnow()
+    active = bool(sub_until and sub_until > now)
+    status = f"Активна до <b>{sub_until.strftime('%d.%m.%Y %H:%M')} UTC</b> ✅" if active else "Не активна ❌"
 
-    lvl1, lvl2 = await count_referrals(user_db_id)
-    progress = await get_progress(user_db_id)
-    progress_str = (f"{max(progress+1, 0)}/{len(MODULES)}" if progress >= 0 else f"0/{len(MODULES)}") if len(MODULES) else "—"
+    text = f"""👤 <b>Профиль</b>
 
-    text = (
-        "👤 <b>Профиль</b>\n\n"
-        f"👋 Имя: <b>{first_name or '—'}</b>\n"
-        f"🔹 Username: @{username if username else '—'}\n"
-        f"🆔 ID: <code>{tg_id}</code>\n"
-        f"📅 Регистрация: <b>{reg_date}</b>\n\n"
-        f"🎟 Доступ: <b>{'Открыт ✅' if access else 'Не оплачен ❌'}</b>\n"
-        "🤝 <b>Партнёрка</b>\n"
-        f"• Перешли по ссылке: <b>{click1}</b>\n"
-        f"• 1 линия: <b>{lvl1}</b>\n"
-        f"• 2 линия: <b>{lvl2}</b>\n\n"
-        f"💰 Баланс к выводу: <b>{balance.quantize(Decimal('0.01'))}$</b>\n"
-        f"🏦 Всего заработано: <b>{total_earned.quantize(Decimal('0.01'))}$</b>"
-    )
+👋 Имя: <b>{first_name or '—'}</b>
+🔹 Username: @{username if username else '—'}
+🆔 ID: <code>{tg_id}</code>
+📅 Регистрация: <b>{reg_date}</b>
 
-    kb = kb_profile(access, is_admin(tg_id))
+⭐️ <b>Подписка:</b> {status}"""
+
+    kb = kb_profile(active, is_admin(tg_id))
 
     if edit and isinstance(target, CallbackQuery):
         try:
@@ -1127,15 +1187,7 @@ async def cmd_start(message: Message):
     if is_spam(message.from_user.id):
         return
 
-    args = (message.text or "").split(maxsplit=1)
-    ref_tg_id = None
-    if len(args) > 1 and args[1].startswith("ref_"):
-        try:
-            ref_tg_id = int(args[1].split("_", 1)[1])
-        except Exception:
-            ref_tg_id = None
-
-    await get_or_create_user(message.from_user, ref_tg_id)
+    await get_or_create_user(message.from_user, None)
     await show_home(message)
 
 # ---------------------------------------------------------------------------
@@ -1148,11 +1200,11 @@ async def menu_training(message: Message):
         return
     await show_training(message)
 
-@router.message(F.text == "💸 Заработок")
-async def menu_earn(message: Message):
+@router.message(F.text == "⭐️ Подписка")
+async def menu_subscription(message: Message):
     if is_spam(message.from_user.id):
         return
-    await show_earn(message)
+    await show_subscription(message)
 
 @router.message(F.text == "👤 Профиль")
 async def menu_profile(message: Message):
@@ -1203,7 +1255,7 @@ async def cb_open_module(call: CallbackQuery):
 async def cb_earn_info(call: CallbackQuery):
     text = (
         "📌 <b>Как работает партнёрка</b>\n\n"
-        f"✅ После оплаты доступа (<b>{PRICE_ACCESS}$</b>) ты получаешь:\n"
+        f"✅ После оплаты доступа (<b>{PRICE_MONTH}$</b>) ты получаешь:\n"
         "• личную реферальную ссылку\n"
         "• статистику по партнёрам\n"
         "• начисления на баланс\n\n"
@@ -1214,7 +1266,7 @@ async def cb_earn_info(call: CallbackQuery):
     )
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="💳 Открыть доступ", callback_data="buy_access")],
+            [InlineKeyboardButton(text="💳 Оформить подписку", callback_data="buy_access")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="back:earn")],
         ]
     )
@@ -1370,21 +1422,24 @@ async def cb_withdraw(call: CallbackQuery):
 
 @router.callback_query(F.data == "faq")
 async def cb_faq(call: CallbackQuery):
-    text = (
-        "ℹ️ <b>FAQ</b>\n\n"
-        f"❓ <b>Что входит в доступ за {PRICE_ACCESS}$?</b>\n"
-        "• 6 модулей обучения по переливу трафика (УБД)\n"
-        "• доступ к закрытому каналу/материалам\n"
-        "• партнёрка 50% + 10%\n"
-        "• реферальная ссылка + статистика\n\n"
-        "❓ <b>Доступ навсегда?</b>\n"
-        "Да. Оплата один раз.\n\n"
-        "❓ <b>Что если оплатил, а доступ не открылся?</b>\n"
-        "Нажми «Проверить оплату». Если сеть задержала транзакцию — подожди пару минут.\n"
-        f"Если всё равно нет — напиши в поддержку: {SUPPORT_CONTACT}\n\n"
-        "⚠️ <b>Важно</b>\n"
-        "Результат зависит от твоих действий. Бот — это инструмент, а не «волшебная кнопка»."
-    )
+    text = f"""ℹ️ <b>FAQ</b>
+
+❓ <b>Сколько стоит подписка?</b>
+• <b>{PRICE_MONTH}$</b> / <b>{SUB_DAYS} дней</b>
+
+❓ <b>Что даёт подписка?</b>
+• доступ к материалам и инструкциям
+• доступ к закрытому каналу/чату
+
+❓ <b>Можно продлить заранее?</b>
+Да. Если подписка активна, при оплате дни просто прибавятся.
+
+❓ <b>Что если оплатил, а доступ не открылся?</b>
+Нажми «Проверить оплату». Иногда сеть задерживает транзакцию 1–3 минуты.
+Если всё равно нет — напиши в поддержку: {SUPPORT_CONTACT}
+
+⚠️ <b>Важно</b>
+Бот — инструмент. Результат зависит от твоих действий."""
     try:
         await call.message.edit_text(text, reply_markup=kb_back("back:profile"))
     except Exception:
@@ -1502,28 +1557,30 @@ async def cb_support(call: CallbackQuery):
         await call.message.answer(text, reply_markup=kb_back("back:profile"))
     await call.answer()
 
+@router.callback_query(F.data == "open_sub")
+async def cb_open_sub(call: CallbackQuery):
+    await show_subscription(call, edit=True)
+    await call.answer()
+
+
 # ---------------------------------------------------------------------------
 # Покупка доступа / Проверка оплаты
 # ---------------------------------------------------------------------------
 
 @router.callback_query(F.data == "buy_access")
 async def cb_buy_access(call: CallbackQuery):
-    if await has_access_by_tg(call.from_user.id):
-        await call.answer("✅ У тебя уже открыт доступ.", show_alert=True)
-        return
-
     user_row = await get_user_by_tg(call.from_user.id)
     if not user_row:
         await get_or_create_user(call.from_user, None)
         user_row = await get_user_by_tg(call.from_user.id)
 
     user_db_id = int(user_row["id"])
-    purchase_id = await create_purchase(user_db_id, "access", PRICE_ACCESS)
+    purchase_id = await create_purchase(user_db_id, "sub_month", PRICE_MONTH)
     purchase = await get_purchase(purchase_id)
     amount = Decimal(purchase["amount"])
 
     text = (
-        f"💳 <b>Оплата доступа ({PRICE_ACCESS}$)</b>\n\n"
+        f"💳 <b>Оплата подписки ({PRICE_MONTH}$ / {SUB_DAYS} дней)</b>\n\n"
         "Оплата в <b>USDT (TRC20)</b>.\n\n"
         f"Кошелёк для оплаты:\n<code>{WALLET_ADDRESS or '— не задан —'}</code>\n\n"
         f"Сумма к оплате: <b>{amount} USDT</b>\n\n"
