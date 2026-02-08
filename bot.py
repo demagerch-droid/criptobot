@@ -48,6 +48,16 @@ PRIVATE_CHANNEL_URL = os.getenv("PRIVATE_CHANNEL_URL", "https://t.me/+rD28zEPxrm
 COMMUNITY_GROUP_URL = os.getenv("COMMUNITY_GROUP_URL", "https://t.me/your_group_or_forum_link")
 SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT", "@your_support_username")
 
+# Авто-кик при окончании подписки (бот должен быть админом в канале/чате)
+# Укажи числовые chat_id (обычно начинаются с -100...). 0 = выключено.
+PRIVATE_CHANNEL_ID = int(os.getenv("PRIVATE_CHANNEL_ID", "0"))
+COMMUNITY_GROUP_ID = int(os.getenv("COMMUNITY_GROUP_ID", "0"))
+
+# Логика напоминаний/проверок
+KICK_ON_EXPIRE = os.getenv("KICK_ON_EXPIRE", "1") == "1"
+REMIND_BEFORE_HOURS = int(os.getenv("REMIND_BEFORE_HOURS", "24"))  # напомнить за N часов
+SUB_WATCH_INTERVAL_SEC = int(os.getenv("SUB_WATCH_INTERVAL_SEC", "600"))  # как часто проверять (сек)
+
 # Антиспам (сек)
 ANTISPAM_SECONDS = float(os.getenv("ANTISPAM_SECONDS", "1.2"))
 
@@ -128,6 +138,9 @@ async def init_db():
                     reg_date TEXT,
                     sub_until TEXT DEFAULT '',
                     free_trial_used INTEGER DEFAULT 0,
+                    expire_24h_notified INTEGER DEFAULT 0,
+                    expired_notified INTEGER DEFAULT 0,
+                    kicked INTEGER DEFAULT 0,
                     -- legacy fields (оставлены для совместимости со старой БД)
                     referrer_id INTEGER,
                     full_access INTEGER DEFAULT 0,
@@ -203,6 +216,12 @@ async def init_db():
             await db.execute("ALTER TABLE users ADD COLUMN sub_until TEXT DEFAULT ''")
         if "free_trial_used" not in cols2:
             await db.execute("ALTER TABLE users ADD COLUMN free_trial_used INTEGER DEFAULT 0")
+        if "expire_24h_notified" not in cols2:
+            await db.execute("ALTER TABLE users ADD COLUMN expire_24h_notified INTEGER DEFAULT 0")
+        if "expired_notified" not in cols2:
+            await db.execute("ALTER TABLE users ADD COLUMN expired_notified INTEGER DEFAULT 0")
+        if "kicked" not in cols2:
+            await db.execute("ALTER TABLE users ADD COLUMN kicked INTEGER DEFAULT 0")
         await db.commit()
 
         await db.execute(
@@ -381,6 +400,152 @@ async def has_access_by_tg(tg_id: int) -> bool:
         return False
     return dt > datetime.utcnow()
 
+
+# ---------------------------------------------------------------------------
+# Авто-кик / напоминания по окончанию подписки
+# ---------------------------------------------------------------------------
+
+async def reset_expire_flags(user_db_id: int):
+    async with get_db() as db:
+        await db.execute(
+            "UPDATE users SET expire_24h_notified = 0, expired_notified = 0, kicked = 0 WHERE id = ?",
+            (user_db_id,),
+        )
+        await db.commit()
+
+async def mark_expire_24h_notified(user_db_id: int):
+    async with get_db() as db:
+        await db.execute("UPDATE users SET expire_24h_notified = 1 WHERE id = ?", (user_db_id,))
+        await db.commit()
+
+async def mark_expired_notified(user_db_id: int):
+    async with get_db() as db:
+        await db.execute("UPDATE users SET expired_notified = 1 WHERE id = ?", (user_db_id,))
+        await db.commit()
+
+async def mark_kicked(user_db_id: int):
+    async with get_db() as db:
+        await db.execute("UPDATE users SET kicked = 1 WHERE id = ?", (user_db_id,))
+        await db.commit()
+
+async def _try_ban(bot: Bot, chat_id: int, tg_id: int) -> bool:
+    if not chat_id:
+        return False
+    try:
+        # Баним (чтобы не смог зайти обратно без разбанa)
+        await bot.ban_chat_member(chat_id, tg_id)
+        return True
+    except Exception:
+        return False
+
+async def _try_unban(bot: Bot, chat_id: int, tg_id: int) -> bool:
+    if not chat_id:
+        return False
+    try:
+        await bot.unban_chat_member(chat_id, tg_id, only_if_banned=True)
+        return True
+    except Exception:
+        return False
+
+async def remind_and_kick_expired(bot: Bot):
+    """Проверка подписок:
+    1) Напоминание за REMIND_BEFORE_HOURS
+    2) При окончании — кик/бан из канала+чата и сообщение в боте
+    """
+    now = datetime.utcnow()
+    now_ts = now.strftime("%Y-%m-%d %H:%M:%S")
+    soon = now + timedelta(hours=REMIND_BEFORE_HOURS)
+    soon_ts = soon.strftime("%Y-%m-%d %H:%M:%S")
+
+    # 1) Напомнить, что скоро закончится
+    async with get_db() as db:
+        cur = await db.execute(
+            """
+            SELECT id, tg_id, sub_until
+            FROM users
+            WHERE sub_until != ''
+              AND sub_until > ?
+              AND sub_until <= ?
+              AND COALESCE(expire_24h_notified, 0) = 0
+            """,
+            (now_ts, soon_ts),
+        )
+        soon_rows = await cur.fetchall()
+
+    for r in soon_rows:
+        uid = int(r["id"])
+        tg_id = int(r["tg_id"])
+        sub_until = _parse_dt(r["sub_until"])
+        if not sub_until:
+            await mark_expire_24h_notified(uid)
+            continue
+        try:
+            await bot.send_message(
+                tg_id,
+                f"""⏳ <b>Подписка скоро закончится</b>
+
+До окончания осталось меньше <b>{REMIND_BEFORE_HOURS} ч.</b>
+Дата окончания: <b>{sub_until.strftime('%d.%m.%Y %H:%M')} UTC</b>
+
+Чтобы не потерять доступ к каналу/чату — продли подписку 👇"
+""",
+                reply_markup=main_kb(),
+            )
+        except Exception:
+            pass
+        await mark_expire_24h_notified(uid)
+
+    # 2) Истекшие — кикнуть + напомнить оплатить
+    async with get_db() as db:
+        cur = await db.execute(
+            """
+            SELECT id, tg_id, sub_until
+            FROM users
+            WHERE sub_until != ''
+              AND sub_until <= ?
+              AND COALESCE(kicked, 0) = 0
+            """,
+            (now_ts,),
+        )
+        expired_rows = await cur.fetchall()
+
+    for r in expired_rows:
+        uid = int(r["id"])
+        tg_id = int(r["tg_id"])
+
+        kicked_any = False
+        if KICK_ON_EXPIRE:
+            kicked_any = (await _try_ban(bot, PRIVATE_CHANNEL_ID, tg_id)) or kicked_any
+            kicked_any = (await _try_ban(bot, COMMUNITY_GROUP_ID, tg_id)) or kicked_any
+
+        # Сообщение пользователю
+        try:
+            await bot.send_message(
+                tg_id,
+                """⛔️ <b>Подписка закончилась</b>
+
+Доступ к закрытому каналу/чату остановлен.
+Чтобы продолжить — оформи подписку ещё на месяц 👇
+
+Нажми: ⭐️ <b>Подписка</b> → 💳 <b>Оформить</b> → ✅ <b>Проверить оплату</b>""",
+                reply_markup=main_kb(),
+            )
+        except Exception:
+            pass
+
+        await mark_expired_notified(uid)
+
+        # kicked=1 ставим только если есть куда кикать (чтобы не “сломать” логику при пустых chat_id)
+        if KICK_ON_EXPIRE and (PRIVATE_CHANNEL_ID or COMMUNITY_GROUP_ID):
+            await mark_kicked(uid)
+
+async def subscription_watcher(bot: Bot):
+    while True:
+        try:
+            await remind_and_kick_expired(bot)
+        except Exception as e:
+            logger.exception("subscription_watcher error: %s", e)
+        await asyncio.sleep(max(30, SUB_WATCH_INTERVAL_SEC))
 
 async def get_referrer_chain(user_db_id: int):
     async with get_db() as db:
@@ -792,8 +957,15 @@ async def process_successful_payment(bot: Bot, purchase_row):
 
     new_until = await extend_subscription(user_db_id, SUB_DAYS)
 
+    # Сбрасываем флаги окончания подписки и (если был бан) разбаниваем
+    await reset_expire_flags(user_db_id)
+
     buyer_tg_id = await get_tg_id_by_user_db(user_db_id)
     if buyer_tg_id:
+        # Если пользователь был забанен по окончанию подписки — разбаниваем
+        await _try_unban(bot, PRIVATE_CHANNEL_ID, buyer_tg_id)
+        await _try_unban(bot, COMMUNITY_GROUP_ID, buyer_tg_id)
+
         text = f"""✅ <b>Оплата подтверждена!</b>
 
 ⭐️ Подписка активна до: <b>{new_until.strftime('%d.%m.%Y %H:%M')} UTC</b>
@@ -1855,6 +2027,11 @@ async def cmd_grant(message: Message):
     new_until = await extend_subscription(int(user["id"]), days)
     tg_id = int(user["tg_id"])
 
+    # Сбрасываем флаги окончания подписки и (если был бан) разбаниваем
+    await reset_expire_flags(int(user["id"]))
+    await _try_unban(message.bot, PRIVATE_CHANNEL_ID, tg_id)
+    await _try_unban(message.bot, COMMUNITY_GROUP_ID, tg_id)
+
     await message.answer(
         f"✅ Подписка продлена.\n"
         f"TG ID: <code>{tg_id}</code>\n"
@@ -1864,6 +2041,26 @@ async def cmd_grant(message: Message):
 # ---------------------------------------------------------------------------
 # Fallback
 # ---------------------------------------------------------------------------
+
+@router.message(Command("id"))
+async def cmd_id(message: Message):
+    lines = [
+        f"🆔 <b>Chat ID</b>: <code>{message.chat.id}</code>",
+        f"📌 <b>Тип</b>: <code>{message.chat.type}</code>",
+    ]
+
+    # Если это пересланное сообщение (из канала/чата) — покажем откуда
+    fchat = getattr(message, "forward_from_chat", None)
+    if fchat:
+        lines.append(f"\n📩 <b>Переслано из</b>: <code>{fchat.id}</code> ({fchat.type})")
+
+    forigin = getattr(message, "forward_origin", None)
+    if forigin and getattr(forigin, "chat", None):
+        ch = forigin.chat
+        lines.append(f"\n📩 <b>Переслано из</b>: <code>{ch.id}</code> ({ch.type})")
+
+    await message.answer("\n".join(lines))
+
 
 @router.message(F.text)
 async def handle_withdraw_wallet_input(message: Message):
@@ -1978,6 +2175,10 @@ async def main():
     dp.include_router(router)
 
     await init_db()
+
+    # Фоновая проверка подписок: напоминания + кик по окончанию
+    asyncio.create_task(subscription_watcher(bot))
+
     await bot.delete_webhook(drop_pending_updates=True)
 
     await dp.start_polling(
