@@ -17,6 +17,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart, Command
+from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest, TelegramRetryAfter
 from aiogram.types import (
     Message,
     CallbackQuery,
@@ -335,6 +336,13 @@ async def update_user_profile(tg_id: int, username: str, first_name: str):
         await db.commit()
 
 
+async def set_user_blocked_by_tg(tg_id: int, flag: int = 1):
+    """Помечаем пользователя как is_blocked=1, если он заблокировал бота/чат не найден и т.д."""
+    async with get_db() as db:
+        await db.execute("UPDATE users SET is_blocked = ? WHERE tg_id = ?", (int(flag), tg_id))
+        await db.commit()
+
+
 async def get_or_create_user(tg_user, referrer_tg_id: int | None):
     existing = await get_user_by_tg(tg_user.id)
     if existing:
@@ -587,6 +595,9 @@ async def add_balance(user_db_id: int, amount: Decimal):
 # Пользователь нажал “Вывести” и мы ждём, пока он пришлёт кошелёк одним сообщением.
 # Ключ: tg_id пользователя -> datetime (когда начал процесс)
 WAITING_WITHDRAW_WALLET: dict[int, datetime] = {}
+
+# Админ нажал «Рассылка» — ждём сообщение для отправки всем пользователям
+BROADCAST_WAITING: dict[int, bool] = {}
 
 
 def _now_ts() -> str:
@@ -1820,9 +1831,9 @@ async def cb_buy_access(call: CallbackQuery):
     text = (
         f"💳 <b>Оплата подписки ({PRICE_MONTH}$ / {SUB_DAYS} дней)</b>\n\n"
         "Оплата в <b>USDT (TRC20)</b>.\n\n"
-        f"Кошелёк для оплаты:\nНажми на адрес и он скопируется\n\n<code>{WALLET_ADDRESS or '— не задан —'}</code>\n\n"
+        f"Кошелёк для оплаты:\n<code>{WALLET_ADDRESS or '— не задан —'}</code>\n\n"
         f"Сумма к оплате: <b>{amount} USDT</b>\n\n"
-        "⚠️ Важно: отправь <b>ТОЧНО</b> эту сумму (с хвостиком) и внимательно посчитай комисию, иначе бот не сопоставит платёж.\n\n"
+        f"Кошелёк для оплаты:\nНажми на адрес и он скопируется\n\n<code>{WALLET_ADDRESS or '— не задан —'}</code>\n\n"
         "После оплаты нажми «Проверить оплату»."
     )
 
@@ -1926,6 +1937,7 @@ async def cb_admin_panel(call: CallbackQuery):
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
+            [InlineKeyboardButton(text="📣 Рассылка", callback_data="admin_broadcast")],
             [InlineKeyboardButton(text="✅ Как выдать доступ", callback_data="admin_grant_help")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="back:profile")],
         ]
@@ -2014,6 +2026,148 @@ async def cb_admin_stats(call: CallbackQuery):
         await call.message.answer(text, reply_markup=kb)
 
     await call.answer()
+
+
+# ---------------------------------------------------------------------------
+# Admin: Рассылка всем пользователям
+# ---------------------------------------------------------------------------
+
+def kb_broadcast_cancel() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="broadcast_cancel")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_panel")],
+        ]
+    )
+
+@router.callback_query(F.data == "admin_broadcast")
+async def cb_admin_broadcast(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("⛔️ Нет доступа", show_alert=True)
+        return
+
+    BROADCAST_WAITING[call.from_user.id] = True
+
+    text = (
+        "📣 <b>Рассылка</b>\n\n"
+        "Отправь <b>следующим сообщением</b> то, что нужно разослать всем пользователям бота.\n"
+        "Можно отправлять: текст, фото, видео, пост, документ — бот сделает копию сообщения.\n\n"
+        "⚠️ Рекомендация: делай коротко и по делу (Telegram не любит спам).\n\n"
+        "Для отмены нажми «❌ Отмена»."
+    )
+
+    try:
+        await call.message.edit_text(text, reply_markup=kb_broadcast_cancel())
+    except Exception:
+        await call.message.answer(text, reply_markup=kb_broadcast_cancel())
+
+    await call.answer()
+
+@router.callback_query(F.data == "broadcast_cancel")
+async def cb_broadcast_cancel(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("⛔️ Нет доступа", show_alert=True)
+        return
+    BROADCAST_WAITING.pop(call.from_user.id, None)
+    try:
+        await call.message.edit_text("✅ Ок, рассылку отменил.", reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_panel")]]
+        ))
+    except Exception:
+        await call.message.answer("✅ Ок, рассылку отменил.", reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_panel")]]
+        ))
+    await call.answer()
+
+@router.message(lambda m: m.from_user and BROADCAST_WAITING.get(m.from_user.id, False))
+async def handle_admin_broadcast_message(message: Message):
+    # безопасность: только админ
+    if not is_admin(message.from_user.id):
+        return
+
+    # снимаем режим ожидания
+    BROADCAST_WAITING.pop(message.from_user.id, None)
+
+    # если админ написал отмену текстом
+    txt = (message.text or "").strip().lower()
+    if txt in ("отмена", "cancel", "стоп"):
+        await message.answer("✅ Ок, рассылка отменена.")
+        return
+
+    # берём список пользователей
+    async with get_db() as db:
+        cur = await db.execute("SELECT tg_id FROM users WHERE COALESCE(is_blocked, 0) = 0")
+        rows = await cur.fetchall()
+
+    tg_ids = [int(r["tg_id"]) for r in rows if r and r["tg_id"]]
+    total = len(tg_ids)
+
+    if total == 0:
+        await message.answer("Пользователей в базе пока нет.")
+        return
+
+    await message.answer(f"📣 Начинаю рассылку…\nВсего получателей: <b>{total}</b>")
+
+    sent = 0
+    failed = 0
+    blocked = 0
+
+    from_chat_id = message.chat.id
+    src_message_id = message.message_id
+
+    for i, tg_id in enumerate(tg_ids, start=1):
+        try:
+            await message.bot.copy_message(
+                chat_id=tg_id,
+                from_chat_id=from_chat_id,
+                message_id=src_message_id,
+            )
+            sent += 1
+        except TelegramRetryAfter as e:
+            # если словили лимит — подождём и попробуем 1 раз
+            wait_s = int(getattr(e, "retry_after", 1)) + 1
+            await asyncio.sleep(wait_s)
+            try:
+                await message.bot.copy_message(chat_id=tg_id, from_chat_id=from_chat_id, message_id=src_message_id)
+                sent += 1
+            except Exception:
+                failed += 1
+        except TelegramForbiddenError:
+            # пользователь заблокировал бота / запретил сообщения
+            failed += 1
+            blocked += 1
+            try:
+                await set_user_blocked_by_tg(tg_id, 1)
+            except Exception:
+                pass
+        except TelegramBadRequest:
+            failed += 1
+        except Exception:
+            failed += 1
+
+        # лёгкий троттлинг, чтобы не ловить лимиты
+        if i % 25 == 0:
+            await asyncio.sleep(0.35)
+        else:
+            await asyncio.sleep(0.05)
+
+        # прогресс каждые 250
+        if i % 250 == 0:
+            try:
+                await message.answer(f"⏳ Прогресс: <b>{i}/{total}</b> • ✅ {sent} • ❌ {failed}")
+            except Exception:
+                pass
+
+    await message.answer(
+        "✅ <b>Рассылка завершена!</b>\n\n"
+        f"👥 Всего: <b>{total}</b>\n"
+        f"✅ Отправлено: <b>{sent}</b>\n"
+        f"❌ Ошибки: <b>{failed}</b>\n"
+        f"🚫 Заблокировали бота: <b>{blocked}</b>"
+    )
+
+
+
 
 
 async def _find_user_by_identifier(identifier: str):
